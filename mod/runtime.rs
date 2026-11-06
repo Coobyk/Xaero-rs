@@ -1,9 +1,9 @@
-//! Xaero-rs runtime, compiled into the game as module `umbx_xaero`
-//! (injected into `crates/horizon-client/src/game.rs`).
-//!
-//! All game-touching state and logic lives here. Hook shims under `hooks/`
-//! call into this module. Game-independent code belongs in
-//! `xaero_rs_engine` instead.
+// Xaero-rs runtime, compiled into the game as module `umbx_xaero`
+// (injected into `crates/horizon-client/src/game.rs`).
+//
+// All game-touching state and logic lives here. Hook shims under `hooks/`
+// call into this module. Game-independent code belongs in
+// `xaero_rs_engine` instead.
 
 use std::cell::RefCell;
 
