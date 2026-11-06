@@ -13,6 +13,12 @@ file = "crates/horizon-client/src/game.rs"
 name = "umbx_xaero"
 source = "runtime.rs"
 
+[[module]]
+id = "storage"
+file = "crates/horizon-client/src/game.rs"
+name = "umbx_xaero_storage"
+source = "storage.rs"
+
 [[crate]]
 id = "engine"
 path = "engine"
@@ -183,6 +189,28 @@ bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "mod_id", ty = "&str", value = "mod_id" },
   { name = "button", ty = "usize", value = "button" },
+]
+
+[[injection]]
+id = "open_world"
+kind = "HEAD"
+target = "horizon_client::game::Game<'_>::open_world"
+helper = "hooks/open_world.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "folder", ty = "&str", value = "folder" },
+]
+
+[[injection]]
+id = "world_lifecycle"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_world_lifecycle"
+helper = "hooks/world_lifecycle.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+    { name = "context", ty = "&crate::mod_api::NativeLifecycleContext", value = "&*context" },
+  { name = "phase", ty = "&crate::mod_api::WorldPhase", value = "&*phase" },
+  { name = "error_text", ty = "&str", value = "error_text" },
 ]
 
 [[injection]]

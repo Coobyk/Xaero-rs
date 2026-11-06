@@ -230,7 +230,7 @@ fn write_waypoint(sw: &StoredWaypoint) -> String {
 }
 
 /// Xaero derives initials from the name's first letters when absent.
-fn default_initials(name: &str) -> String {
+pub fn default_initials(name: &str) -> String {
     let chars: Vec<char> = name.chars().collect();
     if chars.is_empty() {
         return String::new();

@@ -7,6 +7,8 @@
 
 use std::cell::RefCell;
 
+use xaero_rs_engine::xaero::regions::{Pixel as RegionPixel, Region, Tile as RegionTile};
+use xaero_rs_engine::xaero::waypoints::{StoredWaypoint, WaypointFile};
 use xaero_rs_engine::{Waypoint, WaypointColor};
 
 use horizon_client::mod_api::{Corner, NativeMinimap, NativeMod, NativeScreenView};
@@ -118,6 +120,9 @@ pub(super) struct MapTile {
     depth: [u8; 256],
     /// The column's surface is water (map colour WATER): shade by depth.
     water: [bool; 256],
+    /// The surface block state and biome, for Xaero region export.
+    state: [u16; 256],
+    biome: [u16; 256],
     scanned: std::time::Instant,
     revision: u64,
 }
@@ -129,6 +134,8 @@ impl MapTile {
             height: [0; 256],
             depth: [0; 256],
             water: [false; 256],
+            state: [0; 256],
+            biome: [0; 256],
             scanned: std::time::Instant::now(),
             revision: 0,
         }
@@ -149,6 +156,10 @@ pub(super) struct TileStore {
     /// lava, |4 air, |8 sturdy top) - the game minimap's Palette.
     color: Vec<u8>,
     flags: Vec<u8>,
+    /// Decoded Xaero regions, by region coords (512x512 blocks).
+    regions: std::collections::HashMap<(i32, i32), Option<Region>>,
+    /// Regions whose tiles changed since the last save.
+    dirty: std::collections::HashSet<(i32, i32)>,
 }
 
 impl TileStore {
@@ -157,6 +168,8 @@ impl TileStore {
             tiles: Default::default(),
             color: Vec::new(),
             flags: Vec::new(),
+            regions: Default::default(),
+            dirty: Default::default(),
         }
     }
 
@@ -217,7 +230,17 @@ impl TileStore {
                 if !stale {
                     continue;
                 }
-                let tile = self.scan_tile(game, chunk, air, world.revision);
+                // Xaero region data covers terrain the live chunks don't have
+                // (explored before, out of render distance).
+                let tile = if chunk_ready(chunk, air) {
+                    self.scan_tile(game, chunk, air, world.revision)
+                } else if let Some(t) = self.import_tile(game, key) {
+                    t
+                } else {
+                    self.scan_tile(game, chunk, air, world.revision)
+                };
+                let (rx, rz) = (key.0.div_euclid(32), key.1.div_euclid(32));
+                self.dirty.insert((rx, rz));
                 let before = self.tiles.get(&key);
                 changed |= before.is_none_or(|t| t.rgb != tile.rgb);
                 self.tiles.insert(key, tile);
@@ -278,6 +301,9 @@ impl TileStore {
                 tile.height[slot] = y as i16;
                 tile.depth[slot] = depth;
                 tile.water[slot] = color == WATER;
+                let state_id = chunk.block(x, y, z).0 as u16;
+                tile.state[slot] = state_id;
+                tile.biome[slot] = chunk.biome(x, y, z);
                 tile.rgb[slot] = if color == 0 {
                     [20, 20, 20]
                 } else {
@@ -372,9 +398,229 @@ fn ring_offsets(ring: i32) -> Vec<(i32, i32)> {
     out
 }
 
+/// Whether the chunk has the columns a live scan needs (world surface
+/// sections present, not just light data).
+fn chunk_ready(chunk: &std::sync::Arc<horizon_client::chunk::Chunk>, air: u32) -> bool {
+    (0..chunk.sections.len())
+        .rev()
+        .any(|s| (0..16).any(|x| chunk.get(x, chunk.min_y() + s * 16, 0) != air))
+        || chunk.world_surface(0, 0, |id| id == air) > chunk.min_y()
+}
+
+impl TileStore {
+    /// The decoded region for chunk `key`'s area, loading it once from disk.
+    fn region(
+        &mut self,
+        game: &crate::game::Game<'_>,
+        rx: i32,
+        rz: i32,
+    ) -> Option<&Region> {
+        let dim = super::umbx_xaero_storage::dimension_number(game.native_dimension());
+        self.regions.entry((rx, rz)).or_insert_with(|| {
+            super::umbx_xaero_storage::load_region(game, dim, rx, rz)
+        }).as_ref()
+    }
+
+    /// Builds a tile from the Xaero region data for chunk `key`, when the
+    /// region has that chunk.
+    fn import_tile(
+        &mut self,
+        game: &crate::game::Game<'_>,
+        key: (i32, i32),
+    ) -> Option<MapTile> {
+        let (cx, cz) = key;
+        let (rx, rz) = (cx.div_euclid(32), cz.div_euclid(32));
+        let rcx = cx.rem_euclid(32);
+        let rcz = cz.rem_euclid(32);
+        let region = self.region(game, rx, rz)?;
+        let chunk = region
+            .chunks
+            .iter()
+            .find(|c| c.at.0 == rcx as u8 && c.at.1 == rcz as u8)?;
+        let tx = (rcx % 4) as usize;
+        let tz = (rcz % 4) as usize;
+        let tile = chunk.tiles.get(tz * 4 + tx)?.as_ref()?;
+        let facts = game.res.facts();
+        let biomes = game.res.biomes();
+        let mut out = MapTile::empty();
+        for slot in 0..256usize {
+            let px: &RegionPixel = &tile.pixels[slot];
+            out.height[slot] = px.height;
+            out.depth[slot] = px
+                .top_height
+                .map(|t| (t as i16 - px.height).max(0) as u8)
+                .unwrap_or(0);
+            out.water[slot] = px.state.as_deref() == Some("minecraft:water");
+            out.state[slot] = self
+                .color_by_name(px.state.as_deref().unwrap_or("minecraft:grass_block"), facts)
+                .unwrap_or(0) as u16;
+            out.biome[slot] = px
+                .biome
+                .as_deref()
+                .and_then(|b| biomes.index.get(b).copied())
+                .unwrap_or(0);
+            out.rgb[slot] = self.import_rgb(game, px);
+        }
+        out.revision = 1;
+        Some(out)
+    }
+
+    /// A block state id whose facts carry `name` (linear scan of the names;
+    /// used only on region import, then cached by the caller's tile).
+    fn color_by_name(
+        &self,
+        name: &str,
+        facts: &horizon_client::blocks::BlockFacts,
+    ) -> Option<u8> {
+        facts
+            .states
+            .iter()
+            .position(|f| &*f.name == name)
+            .map(|i| self.color[i])
+    }
+
+    /// The map RGB for an imported pixel: map colour of its state, tinted by
+    /// its biome.
+    fn import_rgb(
+        &self,
+        game: &crate::game::Game<'_>,
+        px: &RegionPixel,
+    ) -> [u8; 3] {
+        let facts = game.res.facts();
+        let biomes = game.res.biomes();
+        let name = px.state.as_deref().unwrap_or("minecraft:grass_block");
+        let id = self
+            .color_by_name(name, facts)
+            .map(|c| usize::from(c))
+            .filter(|c| *c != 0)
+            .unwrap_or(1.min(horizon_client::blocks::MAP_COLORS.len() - 1));
+        let col = horizon_client::blocks::MAP_COLORS[id];
+        let [r, g, b] = unpack(col);
+        let tint: u32 = if GRASS_TINTS.contains(&name) {
+            px.biome
+                .as_deref()
+                .and_then(|b| biomes.index.get(b).copied())
+                .map(|bi| {
+                    biomes.grass(bi, 0.0, 0.0)
+                })
+                .unwrap_or(0xFF_FF_FF)
+        } else if name.ends_with("_leaves") || name == "minecraft:vine" {
+            px.biome
+                .as_deref()
+                .and_then(|b| biomes.index.get(b).copied())
+                .map(|bi| biomes.get(bi).foliage)
+                .unwrap_or(0xFF_FF_FF)
+        } else if name == "minecraft:water" {
+            px.biome
+                .as_deref()
+                .and_then(|b| biomes.index.get(b).copied())
+                .map(|bi| biomes.get(bi).water)
+                .unwrap_or(0xFF_FF_FF)
+        } else {
+            0xFF_FF_FF
+        };
+        [
+            ((u32::from(r) * (tint >> 16 & 255)) >> 8) as u8,
+            ((u32::from(g) * (tint >> 8 & 255)) >> 8) as u8,
+            ((u32::from(b) * (tint & 255)) >> 8) as u8,
+        ]
+    }
+
+    /// Exports one tile as a region tile (Xaero 7.8 stream data).
+    fn export_tile(&self, game: &crate::game::Game<'_>, t: &MapTile) -> RegionTile {
+        let facts = game.res.facts();
+        let biomes = game.res.biomes();
+        let pixels = (0..256usize)
+            .map(|slot| RegionPixel {
+                height: t.height[slot],
+                top_height: Some((t.height[slot] + i16::from(t.depth[slot])).clamp(0, 255) as u8),
+                light: 15,
+                cave: false,
+                state: Some(
+                    facts
+                        .states
+                        .get(usize::from(t.state[slot]))
+                        .map(|f| f.name.to_string())
+                        .unwrap_or_else(|| "minecraft:grass_block".to_owned()),
+                ),
+                biome: Some(
+                    biomes
+                        .list
+                        .get(usize::from(t.biome[slot]))
+                        .map(|b| b.name.clone())
+                        .unwrap_or_else(|| "minecraft:plains".to_owned()),
+                ),
+            })
+            .collect();
+        RegionTile {
+            pixels,
+            interp_version: 1,
+            cave_start: i32::MAX,
+            cave_depth: 30,
+        }
+    }
+
+    /// Writes every dirty region to disk (Xaero's roots), clearing the set.
+    pub(super) fn save_dirty(&mut self, game: &crate::game::Game<'_>) {
+        let dim = super::umbx_xaero_storage::dimension_number(game.native_dimension());
+        let dirty: Vec<(i32, i32)> = self.dirty.drain().collect();
+        for (rx, rz) in dirty {
+            let Some(chunks) = self.chunks_of_region(game, rx, rz) else {
+                continue;
+            };
+            let region = Region {
+                chunks,
+                truncated: false,
+            };
+            super::umbx_xaero_storage::save_region(game, dim, rx, rz, &region);
+        }
+    }
+
+    /// Builds the region's chunk list from the tile store: every 32x32-chunk
+    /// square of stored tiles becomes one chunk with 16 tiles.
+    fn chunks_of_region(
+        &self,
+        game: &crate::game::Game<'_>,
+        rx: i32,
+        rz: i32,
+    ) -> Option<Vec<xaero_rs_engine::xaero::regions::Chunk>> {
+        let mut chunks = Vec::new();
+        for rcx in 0..8i32 {
+            for rcz in 0..8i32 {
+                let mut tiles: Vec<Option<RegionTile>> = Vec::with_capacity(16);
+                let mut any = false;
+                for tz in 0..4i32 {
+                    for tx in 0..4i32 {
+                        let cx = rx * 32 + rcx * 4 + tx;
+                        let cz = rz * 32 + rcz * 4 + tz;
+                        match self.tiles.get(&(cx, cz)) {
+                            Some(t) => {
+                                any = true;
+                                tiles.push(Some(self.export_tile(game, t)));
+                            }
+                            None => tiles.push(None),
+                        }
+                    }
+                }
+                chunks.push(xaero_rs_engine::xaero::regions::Chunk {
+                    at: (rcx as u8, rcz as u8),
+                    tiles,
+                });
+                let _ = any;
+            }
+        }
+        (!chunks.is_empty()).then_some(chunks)
+    }
+}
+
 pub struct State {
     pub minimap: MinimapSettings,
-    pub waypoints: Vec<Waypoint>,
+    /// This dimension's waypoints (order = file order).
+    pub waypoints: Vec<StoredWaypoint>,
+    /// The waypoint file's sets and preserved lines for this dimension.
+    pub wp_file: WaypointFile,
+    /// Waypoints for the current dimension were loaded from disk.
+    pub wp_loaded: bool,
     /// Colour index for the next waypoint created with Y.
     pub next_color: usize,
     pub map: Option<MapView>,
@@ -388,6 +634,8 @@ pub struct State {
     pub view_h: f32,
     /// The dimension the store was built for.
     pub dimension: &'static str,
+    /// Seconds since the last periodic save.
+    pub save_timer: f32,
 }
 
 impl State {
@@ -395,6 +643,8 @@ impl State {
         let mut s = Self {
             minimap: MinimapSettings::default(),
             waypoints: Vec::new(),
+            wp_file: WaypointFile::default(),
+            wp_loaded: false,
             next_color: 0,
             map: None,
             store: TileStore::new(),
@@ -403,6 +653,7 @@ impl State {
             view_w: 480.0,
             view_h: 300.0,
             dimension: game.native_dimension(),
+            save_timer: 0.0,
         };
         let get = |key: &str| game.native_setting(ID, key);
         if get("minimap_enabled").is_some() {
@@ -422,16 +673,6 @@ impl State {
             s.minimap.rotate = get("minimap_rotate").is_none_or(|v| v.trim() != "false");
             s.minimap.round = get("minimap_round").is_some_and(|v| v.trim() == "true");
             s.minimap.radar = get("minimap_radar").is_none_or(|v| v.trim() != "false");
-        }
-        // A test waypoint so the beam path is visible on first run.
-        if let Some(p) = game.native_player() {
-            s.waypoints.push(Waypoint::new(
-                "Origin",
-                p.x as i64,
-                p.y as i64,
-                p.z as i64,
-                WaypointColor::Red,
-            ));
         }
         s
     }
@@ -519,6 +760,85 @@ fn our_screen(game: &crate::game::Game<'_>, screen: &NativeScreenView<'_>) -> bo
     screen.id == "mod" && game.native_mod_screen() == Some(ID)
 }
 
+// ---------------- world data persistence ----------------
+
+/// The game folder (the working directory): saves, and Xaero's data roots.
+pub(super) fn game_dir(_game: &crate::game::Game<'_>) -> std::path::PathBuf {
+    crate::game::options::game_dir()
+}
+
+impl State {
+    /// Loads this dimension's waypoints once (Xaero's file, both roots).
+    pub(super) fn ensure_waypoints(&mut self, game: &crate::game::Game<'_>) {
+        if self.wp_loaded {
+            return;
+        }
+        self.wp_loaded = true;
+        let n = super::umbx_xaero_storage::dimension_number(self.dimension);
+        let Some(file) = super::umbx_xaero_storage::load_waypoints(game, n) else {
+            return;
+        };
+        self.wp_file = WaypointFile {
+            sets: file.sets.clone(),
+            waypoints: Vec::new(),
+            extra_lines: file.extra_lines.clone(),
+        };
+        self.waypoints = file.waypoints;
+        // Colour cycling resumes after the file's last colour.
+        if let Some(last) = self.waypoints.last() {
+            self.next_color = (last.wp.color.index() + 1) % WaypointColor::ALL.len();
+        }
+    }
+
+    /// Writes this dimension's waypoint file (both roots).
+    pub(super) fn save_waypoints(&mut self, game: &crate::game::Game<'_>) {
+        let n = super::umbx_xaero_storage::dimension_number(self.dimension);
+        let file = WaypointFile {
+            sets: self.wp_file.sets.clone(),
+            waypoints: self.waypoints.clone(),
+            extra_lines: self.wp_file.extra_lines.clone(),
+        };
+        super::umbx_xaero_storage::save_waypoints(game, n, &file);
+    }
+
+    /// Saves everything for the current dimension: waypoints and dirty map
+    /// regions.
+    pub(super) fn save_world_data(&mut self, game: &crate::game::Game<'_>) {
+        if self.wp_loaded {
+            self.save_waypoints(game);
+        }
+        self.store.save_dirty(game);
+    }
+}
+
+/// The world closed (or a dimension was left): flush everything to disk.
+pub(super) fn save_world_data(game: &mut crate::game::Game<'_>) {
+    if !game.native_on(ID) {
+        return;
+    }
+    with_mut(game, |s, game| s.save_world_data(game));
+}
+
+/// The game opened a singleplayer world: remember its save folder.
+pub(super) fn open_world(_game: &mut crate::game::Game<'_>, folder: &str) {
+    super::umbx_xaero_storage::open_world(_game, folder);
+}
+
+/// A world lifecycle phase arrived.
+pub(super) fn world_lifecycle(
+    game: &mut crate::game::Game<'_>,
+    _context: &crate::mod_api::NativeLifecycleContext,
+    phase: &crate::mod_api::WorldPhase,
+    _error_text: &str,
+) {
+    if matches!(
+        phase,
+        crate::mod_api::WorldPhase::WorldCloseFinal | crate::mod_api::WorldPhase::WorldCloseFailed
+    ) {
+        save_world_data(game);
+    }
+}
+
 // --- hooks (called by the shims under hooks/) ---
 
 pub(super) fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
@@ -565,27 +885,34 @@ pub(super) fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             return;
         }
         let p = game.native_player();
-        with_mut(game, |s, _game| {
+        with_mut(game, |s, game| {
             if let Some(p) = p {
-                s.waypoints.push(Waypoint::new(
+                s.ensure_waypoints(game);
+                let mut wp = Waypoint::new(
                     &format!("Waypoint {}", s.waypoints.len() + 1),
                     p.x as i64,
                     p.y as i64,
                     p.z as i64,
                     WaypointColor::from_index(s.next_color),
-                ));
+                );
+                wp.symbol =
+                    xaero_rs_engine::xaero::waypoints::default_initials(&wp.name);
+                s.waypoints.push(StoredWaypoint::simple(wp));
                 s.next_color = (s.next_color + 1) % WaypointColor::ALL.len();
+                s.save_waypoints(game);
             }
         });
     } else if toggle {
         if !playing {
             return;
         }
-        with_mut(game, |s, _game| {
-            let any_on = s.waypoints.iter().any(|w| w.enabled);
+        with_mut(game, |s, game| {
+            s.ensure_waypoints(game);
+            let any_on = s.waypoints.iter().any(|w| w.wp.enabled);
             for w in &mut s.waypoints {
-                w.enabled = !any_on;
+                w.wp.enabled = !any_on;
             }
+            s.save_waypoints(game);
         });
     } else if (zoom_in || zoom_out) && game.native_playing() {
         with_mut(game, |s, game| {
@@ -602,15 +929,28 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
     let mut compose_upload = false;
     with_mut(game, |s, game| {
         s.store.ensure_palette(game.res.facts());
-        // Dimension changed: the store belongs to the old dimension.
+        // Dimension changed: flush the old dimension's data, drop the store.
         let dim = game.native_dimension();
         if dim != s.dimension {
+            s.save_world_data(game);
             s.dimension = dim;
             s.store.tiles.clear();
+            s.store.regions.clear();
+            s.store.dirty.clear();
+            s.wp_loaded = false;
+            s.waypoints.clear();
+            s.wp_file = WaypointFile::default();
             s.needs_upload = true;
             if let Some(map) = &mut s.map {
                 map.dirty = true;
             }
+        }
+        s.ensure_waypoints(game);
+        // Periodic save, so a crash loses at most half a minute of exploring.
+        s.save_timer += 0.5;
+        if s.save_timer >= 30.0 {
+            s.save_timer = 0.0;
+            s.save_world_data(game);
         }
         let px = game.native_player().map(|p| (p.x, p.z));
         let (pcx, pcz) = px.map(|p| (p.0.div_euclid(16.0) as i32, p.1.div_euclid(16.0) as i32)).unwrap_or((0, 0));
@@ -749,11 +1089,11 @@ pub(super) fn world_primitives(
         return;
     }
     with(game, |s| {
-        for w in s.waypoints.iter().filter(|w| w.enabled) {
-            let [x, y, z] = w.anchor();
-            primitives.beam([x, y, z], 256, w.color.argb());
+        for w in s.waypoints.iter().filter(|w| w.wp.enabled) {
+            let [x, y, z] = w.wp.anchor();
+            primitives.beam([x, y, z], 256, w.wp.color.argb());
             primitives
-                .text([x, y + 260.0, z], w.name.clone(), w.color.argb(), 1.0)
+                .text([x, y + 260.0, z], w.wp.name.clone(), w.wp.color.argb(), 1.0)
                 .through_walls()
                 .scale_with_distance()
                 .background();
@@ -790,14 +1130,14 @@ pub(super) fn screen_render_post(
         let span_z = f64::from(batch.height) * map.blocks_per_pixel;
         let wx0 = map.center_x - span_x / 2.0;
         let wz0 = map.center_z - span_z / 2.0;
-        for w in s.waypoints.iter().filter(|w| w.enabled) {
-            let px = rx + ((w.pos[0] as f64 - wx0) / span_x * rw as f64) as f32;
-            let py = ry + ((w.pos[2] as f64 - wz0) / span_z * rh as f64) as f32;
+        for w in s.waypoints.iter().filter(|w| w.wp.enabled) {
+            let px = rx + ((w.wp.pos[0] as f64 - wx0) / span_x * rw as f64) as f32;
+            let py = ry + ((w.wp.pos[2] as f64 - wz0) / span_z * rh as f64) as f32;
             if px < rx - 8.0 || py < ry - 8.0 || px > rx + rw + 8.0 || py > ry + rh + 8.0 {
                 continue;
             }
-            game.native_fill(batch, [px - 3.0, py - 3.0, 6.0, 6.0], w.color.argb());
-            game.native_text(batch, &w.name, [px + 5.0, py - 4.0], 0xFF_FF_FF, true);
+            game.native_fill(batch, [px - 3.0, py - 3.0, 6.0, 6.0], w.wp.color.argb());
+            game.native_text(batch, &w.wp.name, [px + 5.0, py - 4.0], 0xFF_FF_FF, true);
         }
 
         // Status line: coordinates and scale.
@@ -955,9 +1295,37 @@ pub(super) fn settings_click(game: &mut crate::game::Game<'_>, mod_id: &str, but
 }
 
 pub(super) fn player_died(game: &mut crate::game::Game<'_>, _player: u128, _cause: Option<&str>) {
-    // Deathpoint waypoints land here (compare `player` with the local
-    // player's UUID first once we track it).
-    let _ = game;
+    if !game.native_on(ID) || game.native_player().is_none() {
+        return;
+    }
+    let at = game.native_player().map(|p| [p.x as i64, p.y as i64, p.z as i64]);
+    with_mut(game, |s, game| {
+        s.ensure_waypoints(game);
+        // The previous "latest death" becomes an old deathpoint.
+        for w in &mut s.waypoints {
+            if w.kind == 1 {
+                w.kind = 2;
+                w.wp.set = "gui.xaero_deathpoint_old".to_owned();
+                w.wp.name = "gui.xaero_deathpoint_old".to_owned();
+            }
+        }
+        if let Some(at) = at {
+            let mut wp = Waypoint::new(
+                "gui.xaero_deathpoint",
+                at[0],
+                at[1],
+                at[2],
+                WaypointColor::from_index(0),
+            );
+            wp.symbol = "D".to_owned();
+            wp.set = "gui.xaero_deathpoint".to_owned();
+            wp.enabled = true;
+            let mut sw = StoredWaypoint::simple(wp);
+            sw.kind = 1;
+            s.waypoints.insert(0, sw);
+        }
+        s.save_waypoints(game);
+    });
 }
 
 pub(super) fn list(mods: &mut Vec<NativeMod>) {
