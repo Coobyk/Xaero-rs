@@ -528,7 +528,7 @@ pub fn screen_key(
     }
     with(game, |s| {
         if let Some(map) = &mut s.map {
-            let step = |inward: bool| {
+            let mut step = |inward: bool| {
                 let factor = if inward { 0.8 } else { 1.25 };
                 map.blocks_per_pixel = (map.blocks_per_pixel * factor).clamp(0.05, 64.0);
                 map.dirty = true;
