@@ -38,6 +38,7 @@ target = "horizon_client::game::native_hooks::Game<'_>::native_frame"
 helper = "hooks/frame.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "elapsed", ty = "std::time::Duration", value = "elapsed" },
 ]
 
 [[injection]]
@@ -66,6 +67,8 @@ target = "horizon_client::game::native_hooks::Game<'_>::native_world_primitives"
 helper = "hooks/world_primitives.rs"
 bindings = [
   { name = "game", ty = "&crate::game::Game<'_>", value = "&*self" },
+  { name = "partial", ty = "f32", value = "partial" },
+  { name = "camera", ty = "[f64; 3]", value = "camera" },
   { name = "primitives", ty = "&mut horizon_client::world_primitives::WorldPrimitives", value = "&mut *primitives" },
 ]
 
