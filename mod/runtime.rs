@@ -810,24 +810,24 @@ fn radar_dot(
     );
 }
 
-/// The minimap's on-screen rect, replicating `Corners::place` for the first
-/// widget of its corner (the game places the minimap before the hud hook).
+/// The minimap's on-screen rect. The game places the minimap before the hud
+/// hook, so placing the same size again and stepping back one slot recovers
+/// its rect (Corners stacks widgets per corner, 2 px margins).
 fn minimap_rect(
-    game: &crate::game::Game<'_>,
+    _game: &crate::game::Game<'_>,
+    corners: &mut horizon_client::extras_hud::Corners,
     batch: &horizon_client::hud::HudBatch,
     corner: Corner,
     size: f32,
 ) -> [f32; 2] {
     const MARGIN: f32 = 2.0;
-    let x = if corner.left() {
-        MARGIN
-    } else {
-        batch.width - MARGIN - size
-    };
+    let _ = _game;
+    let (mx, my) = corners.place(corner, size, size);
+    let x = if corner.left() { MARGIN } else { mx };
     let y = if corner.top() {
-        MARGIN + game.effect_rows_height()
+        my - size - MARGIN
     } else {
-        batch.height - MARGIN - size
+        my + size + MARGIN
     };
     [x, y]
 }
@@ -855,27 +855,25 @@ pub(super) fn hud(
         return;
     }
     let Some(p) = game.native_player() else { return };
-    let [x, y] = minimap_rect(game, batch, corner, size);
+    let [x, y] = minimap_rect(game, corners, batch, corner, size);
     let (cx, cy) = (x + size / 2.0, y + size / 2.0);
-    let half = size / 2.0 - 3.0;
+    let half = (size / 2.0 - 3.0) as f64;
     // When the map turns with the player, dots turn the other way.
-    let rot = if rotate { -yaw as f64 } else { 0.0 };
+    let rot = if rotate { -f64::from(yaw) } else { 0.0 };
     let (s, c) = rot.to_radians().sin_cos();
-    let mut clamp = |dx: f32, dz: f32| -> Option<[f32; 2]> {
+    let mut clamp = |dx: f64, dz: f64| -> Option<[f32; 2]> {
         let len = (dx * dx + dz * dz).sqrt();
-        if len > half {
-            if len < 0.001 {
-                return None;
-            }
+        let (dx, dz) = if len > half && len > 0.001 {
             let f = half / len;
-            Some([cx + dx * f, cy + dz * f])
+            (dx * f, dz * f)
         } else {
-            Some([cx + dx, cy + dz])
-        }
+            (dx, dz)
+        };
+        Some([(cx as f64 + dx) as f32, (cy as f64 + dz) as f32])
     };
     for m in game.mobs.iter().filter(|m| !m.removed && !m.invisible) {
-        let dx = ((m.position.x - p.position.x) / bpp) as f32;
-        let dz = ((m.position.z - p.position.z) / bpp) as f32;
+        let dx = (m.position.x - p.x) / bpp;
+        let dz = (m.position.z - p.z) / bpp;
         // Map-north-up: the map's screen up is -Z. Rotate when turning.
         let (rx, rz) = if rotate {
             (dx * c - dz * s, dx * s + dz * c)
@@ -893,8 +891,8 @@ pub(super) fn hud(
     }
     // Dropped items, smaller and cyan.
     for item in game.dropped.iter() {
-        let dx = ((item.position.x - p.position.x) / bpp) as f32;
-        let dz = ((item.position.z - p.position.z) / bpp) as f32;
+        let dx = (item.position.x - p.x) / bpp;
+        let dz = (item.position.z - p.z) / bpp;
         let (rx, rz) = if rotate {
             (dx * c - dz * s, dx * s + dz * c)
         } else {
