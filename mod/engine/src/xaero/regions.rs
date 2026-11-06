@@ -630,6 +630,68 @@ pub fn zip_region(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grass_px(height: i16, biome: &str) -> Pixel {
+        Pixel {
+            height,
+            top_height: None,
+            light: 15,
+            cave: false,
+            state: None,
+            biome: Some(biome.to_owned()),
+        }
+    }
+
+    fn water_px(height: i16, top: u8, biome: &str) -> Pixel {
+        Pixel {
+            height,
+            top_height: Some(top),
+            light: 10,
+            cave: false,
+            state: Some("minecraft:water".to_owned()),
+            biome: Some(biome.to_owned()),
+        }
+    }
+
+    fn sample_region() -> Region {
+        let mut pixels: Vec<Pixel> = Vec::with_capacity(256);
+        for i in 0..256 {
+            pixels.push(if i % 7 == 0 {
+                water_px(60, 63, "minecraft:ocean")
+            } else {
+                grass_px(64 + (i % 5) as i16, "minecraft:plains")
+            });
+        }
+        Region {
+            chunks: vec![Chunk {
+                at: (0, 0),
+                tiles: vec![
+                    Some(Tile {
+                        pixels,
+                        interp_version: 1,
+                        cave_start: i32::MAX,
+                        cave_depth: 30,
+                    }),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+            }],
+            truncated: false,
+        }
+    }
     #[test]
     fn debug_stream() {
         use super::*;
