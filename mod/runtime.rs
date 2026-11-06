@@ -160,6 +160,11 @@ pub(super) struct TileStore {
     imported: std::collections::HashSet<(i32, i32)>,
     /// Regions whose tiles changed since the last save.
     dirty: std::collections::HashSet<(i32, i32)>,
+    /// Block name -> state id, built once with the palette: a 35k-entry
+    /// linear scan per imported pixel was a second-long hitch per region.
+    by_name: std::collections::HashMap<String, u32>,
+    /// A region mid-import: (rx, rz, region, next chunk index).
+    pending: Option<(i32, i32, Region, usize)>,
 }
 
 impl TileStore {
@@ -170,6 +175,8 @@ impl TileStore {
             flags: Vec::new(),
             imported: Default::default(),
             dirty: Default::default(),
+            by_name: Default::default(),
+            pending: None,
         }
     }
 
@@ -193,6 +200,9 @@ impl TileStore {
                 b |= 8;
             }
             self.flags.push(b);
+        }
+        for (i, f) in facts.states.iter().enumerate() {
+            self.by_name.insert(f.name.to_string(), i as u32);
         }
     }
 
@@ -218,20 +228,36 @@ impl TileStore {
         let mut changed = false;
         // 1. Xaero regions intersecting the view, imported whole, once —
         //    first, so saved terrain appears without waiting for live scans.
+        //    A region import continues over frames (16 chunks a frame): the
+        //    per-pixel conversion is real work and must not hitch.
+        const IMPORT_CHUNKS_PER_FRAME: usize = 16;
+        if let Some((rx, rz, region, next)) = &mut self.pending {
+            let end = (*next + IMPORT_CHUNKS_PER_FRAME).min(region.chunks.len());
+            for chunk in &region.chunks[*next..end] {
+                changed |= self.import_region_chunk(game, *rx, *rz, chunk);
+            }
+            *next = end;
+            if *next >= region.chunks.len() {
+                self.pending = None;
+            }
+            return changed;
+        }
         let dim = super::umbx_xaero_storage::dimension_number(game.native_dimension());
         let rx0 = (vcx - half_cx).div_euclid(32);
         let rx1 = (vcx + half_cx).div_euclid(32);
         let rz0 = (vcz - half_cz).div_euclid(32);
         let rz1 = (vcz + half_cz).div_euclid(32);
-        for rx in rx0..=rx1 {
+        'regions: for rx in rx0..=rx1 {
             for rz in rz0..=rz1 {
                 if !self.imported.insert((rx, rz)) {
                     continue;
                 }
-                changed |= self.import_region(game, dim, rx, rz);
-                // One region load per frame: a zip decode is a hitch, and
-                // the rest continue over the next frames.
-                return changed;
+                if let Some(region) =
+                    super::umbx_xaero_storage::load_region(game, dim, rx, rz)
+                {
+                    self.pending = Some((rx, rz, region, 0));
+                    break 'regions; // resumed next frame
+                }
             }
         }
         // 2. Loaded chunks in the view: rescan when the world changed under
@@ -261,33 +287,28 @@ impl TileStore {
         changed
     }
 
-    /// Imports every tile of one region file into the store (missing keys
-    /// only: live scans are fresher).
-    fn import_region(
+    /// Imports one region chunk's tiles (missing keys only: live scans are
+    /// fresher).
+    fn import_region_chunk(
         &mut self,
         game: &crate::game::Game<'_>,
-        dim: i32,
         rx: i32,
         rz: i32,
+        chunk: &xaero_rs_engine::xaero::regions::Chunk,
     ) -> bool {
-        let Some(region) = super::umbx_xaero_storage::load_region(game, dim, rx, rz) else {
-            return false;
-        };
         let mut changed = false;
-        for chunk in &region.chunks {
-            let ccx = rx * 32 + i32::from(chunk.at.0) * 4;
-            let ccz = rz * 32 + i32::from(chunk.at.1) * 4;
-            for (ti, tile) in chunk.tiles.iter().enumerate() {
-                let Some(t) = tile else { continue };
-                let tx = (ti / 4) as i32;
-                let tz = (ti % 4) as i32;
-                let key = (ccx + tx, ccz + tz);
-                if self.tiles.contains_key(&key) {
-                    continue;
-                }
-                self.tiles.insert(key, self.convert_tile(game, t));
-                changed = true;
+        let ccx = rx * 32 + i32::from(chunk.at.0) * 4;
+        let ccz = rz * 32 + i32::from(chunk.at.1) * 4;
+        for (ti, tile) in chunk.tiles.iter().enumerate() {
+            let Some(t) = tile else { continue };
+            let tx = (ti / 4) as i32;
+            let tz = (ti % 4) as i32;
+            let key = (ccx + tx, ccz + tz);
+            if self.tiles.contains_key(&key) {
+                continue;
             }
+            self.tiles.insert(key, self.convert_tile(game, t));
+            changed = true;
         }
         changed
     }
@@ -299,7 +320,6 @@ impl TileStore {
         game: &crate::game::Game<'_>,
         t: &RegionTile,
     ) -> MapTile {
-        let facts = game.res.facts();
         let biomes = game.res.biomes();
         let mut out = MapTile::empty();
         for slot in 0..256usize {
@@ -312,9 +332,7 @@ impl TileStore {
                 .unwrap_or(0);
             out.water[slot] = px.state.as_deref() == Some("minecraft:water");
             let name = px.state.as_deref().unwrap_or("minecraft:grass_block");
-            out.state[slot] = self
-                .color_by_name(name, facts)
-                .unwrap_or(0) as u16;
+            out.state[slot] = self.color_by_name(name).unwrap_or(0) as u16;
             out.biome[slot] = px
                 .biome
                 .as_deref()
@@ -479,17 +497,9 @@ const GRASS_TINTS: [&str; 6] = [
 
 
 impl TileStore {
-    /// A block state id whose facts carry `name`.
-    fn color_by_name(
-        &self,
-        name: &str,
-        facts: &horizon_client::blocks::BlockFacts,
-    ) -> Option<u8> {
-        facts
-            .states
-            .iter()
-            .position(|f| &*f.name == name)
-            .map(|i| self.color[i])
+    /// A block state id whose facts carry `name` (hash lookup).
+    fn color_by_name(&self, name: &str) -> Option<u8> {
+        self.by_name.get(name).map(|i| self.color[*i as usize])
     }
 
     /// The map RGB for an imported pixel, through the same colours as a
@@ -499,10 +509,9 @@ impl TileStore {
         game: &crate::game::Game<'_>,
         px: &RegionPixel,
     ) -> [u8; 3] {
-        let facts = game.res.facts();
         let biomes = game.res.biomes();
         let name = px.state.as_deref().unwrap_or("minecraft:grass_block");
-        let color = self.color_by_name(name, facts).unwrap_or(1);
+        let color = self.color_by_name(name).unwrap_or(1);
         let biome = px
             .biome
             .as_deref()
@@ -1101,6 +1110,7 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
             s.store.tiles.clear();
             s.store.imported.clear();
             s.store.dirty.clear();
+            s.store.pending = None;
             s.wp_loaded = false;
             s.waypoints.clear();
             s.wp_file = WaypointFile::default();
