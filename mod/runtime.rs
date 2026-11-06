@@ -440,7 +440,7 @@ impl TileStore {
             .clone();
         let tx = (rcx % 4) as usize;
         let tz = (rcz % 4) as usize;
-        let tile = chunk.tiles.get(tz * 4 + tx)?.clone();
+        let tile = chunk.tiles.get(tz * 4 + tx)?.clone()?;
         let facts = game.res.facts();
         let biomes = game.res.biomes();
         let mut out = MapTile::empty();
