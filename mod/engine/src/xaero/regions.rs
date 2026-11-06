@@ -51,6 +51,13 @@ pub struct Tile {
     pub cave_depth: u8,
 }
 
+impl Tile {
+    /// The pixel at tile-local column `x`, row `z` (x-major, as on disk).
+    pub fn pixel(&self, x: usize, z: usize) -> &Pixel {
+        &self.pixels[x * 16 + z]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chunk {
     /// (chunkX, chunkZ) in 0..8: block coords are
@@ -771,7 +778,24 @@ mod tests {
         let region = Region {
             chunks: vec![Chunk {
                 at: (0, 0),
-                tiles: vec![Some(tile_a), Some(tile_b), None, None, None, None, None, None, None, None, None, None, None, None, None, None],
+                tiles: vec![
+                    Some(tile_a),
+                    Some(tile_b),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
             }],
             truncated: false,
         };
