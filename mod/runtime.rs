@@ -601,6 +601,7 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
     }
     let mut compose_upload = false;
     with_mut(game, |s, game| {
+        s.store.ensure_palette(game.res.facts());
         // Dimension changed: the store belongs to the old dimension.
         let dim = game.native_dimension();
         if dim != s.dimension {
