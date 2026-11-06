@@ -1468,7 +1468,8 @@ pub(super) fn screen_scrolled(
     with(game, |s| {
         if let Some(map) = &mut s.map {
             // Scroll up zooms in (fewer blocks per pixel), like Xaero.
-            let factor = (-scroll[0] * 0.15).exp();
+            // The wheel is the Y axis of the scroll event.
+            let factor = (-scroll[1] * 0.15).exp();
             map.blocks_per_pixel = (map.blocks_per_pixel * factor).clamp(0.05, 64.0);
             map.dirty = true;
             *canceled = true;
