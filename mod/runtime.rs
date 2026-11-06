@@ -231,14 +231,16 @@ impl TileStore {
         //    A region import continues over frames (16 chunks a frame): the
         //    per-pixel conversion is real work and must not hitch.
         const IMPORT_CHUNKS_PER_FRAME: usize = 16;
-        if let Some((rx, rz, region, next)) = &mut self.pending {
-            let end = (*next + IMPORT_CHUNKS_PER_FRAME).min(region.chunks.len());
-            for chunk in &region.chunks[*next..end] {
-                changed |= self.import_region_chunk(game, *rx, *rz, chunk);
+        if self.pending.is_some() {
+            let Some((rx, rz, region, next)) = self.pending.take() else {
+                return changed;
+            };
+            let end = (next + IMPORT_CHUNKS_PER_FRAME).min(region.chunks.len());
+            for chunk in &region.chunks[next..end] {
+                changed |= self.import_region_chunk(game, rx, rz, chunk);
             }
-            *next = end;
-            if *next >= region.chunks.len() {
-                self.pending = None;
+            if end < region.chunks.len() {
+                self.pending = Some((rx, rz, region, end));
             }
             return changed;
         }
