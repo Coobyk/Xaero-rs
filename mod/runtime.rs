@@ -1181,7 +1181,7 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
         // needs `&mut self`, so this is the one place it can happen. While a
         // drag pans the map, compose at half rate: a 1024x1024 compose plus
         // its 4 MiB upload every frame is the FPS drop the map used to have.
-        s.frame_parity ^= 1;
+        s.frame_parity = !s.frame_parity;
         let dragging = s.map.as_ref().is_some_and(|m| m.dragging.is_some());
         let dirty = s.map.as_ref().is_some_and(|m| m.dirty);
         let due = !dragging || s.frame_parity;
