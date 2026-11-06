@@ -768,6 +768,143 @@ fn our_screen(game: &crate::game::Game<'_>, screen: &NativeScreenView<'_>) -> bo
     screen.id == "mod" && game.native_mod_screen() == Some(ID)
 }
 
+// ---------------- entity radar ----------------
+
+/// Xaero-style radar dot colours: players white, hostiles red, items cyan,
+/// other mobs green.
+fn dot_color(kind: &str) -> u32 {
+    let k = kind.strip_prefix("minecraft:").unwrap_or(kind);
+    const HOSTILE: [&str; 24] = [
+        "zombie", "husk", "drowned", "zombie_villager", "skeleton", "stray", "bogged",
+        "creeper", "spider", "cave_spider", "enderman", "witch", "pillager", "vindicator",
+        "evoker", "ravager", "vex", "phantom", "blaze", "ghast", "slime", "magma_cube",
+        "hoglin", "warden",
+    ];
+    if HOSTILE.contains(&k) {
+        0xE8_3B_3B
+    } else if k == "item" {
+        0x53_F2_E8
+    } else {
+        0x7E_B6_51
+    }
+}
+
+/// One radar dot: a 1 px black outline around a coloured square, Xaero-style.
+fn radar_dot(
+    game: &crate::game::Game<'_>,
+    batch: &mut horizon_client::hud::HudBatch,
+    at: [f32; 2],
+    argb: u32,
+    big: bool,
+) {
+    let (o, i) = if big { (3.0, 2.0) } else { (2.5, 1.5) };
+    game.native_fill(
+        batch,
+        [at[0] - o, at[1] - o, o * 2.0, o * 2.0],
+        0xFF_00_00_00,
+    );
+    game.native_fill(
+        batch,
+        [at[0] - i, at[1] - i, i * 2.0, i * 2.0],
+        0xFF00_0000 | (argb & 0xFF_FF_FF),
+    );
+}
+
+/// The minimap's on-screen rect, replicating `Corners::place` for the first
+/// widget of its corner (the game places the minimap before the hud hook).
+fn minimap_rect(
+    game: &crate::game::Game<'_>,
+    batch: &horizon_client::hud::HudBatch,
+    corner: Corner,
+    size: f32,
+) -> [f32; 2] {
+    const MARGIN: f32 = 2.0;
+    let x = if corner.left() {
+        MARGIN
+    } else {
+        batch.width - MARGIN - size
+    };
+    let y = if corner.top() {
+        MARGIN + game.effect_rows_height()
+    } else {
+        batch.height - MARGIN - size
+    };
+    [x, y]
+}
+
+/// The radar over the minimap (hud hook, fires only while playing).
+pub(super) fn hud(
+    game: &mut crate::game::Game<'_>,
+    batch: &mut horizon_client::hud::HudBatch,
+    _corners: &mut horizon_client::extras_hud::Corners,
+) {
+    if !game.native_on(ID) {
+        return;
+    }
+    let (corner, size, bpp, rotate, yaw, radar_on) = with(game, |s| {
+        (
+            CORNERS[s.minimap.corner],
+            MINIMAP_SIZES[s.minimap.size],
+            f64::from(MINIMAP_ZOOMS[s.minimap.zoom]),
+            s.minimap.rotate,
+            game.yaw,
+            s.minimap.radar,
+        )
+    });
+    if !radar_on {
+        return;
+    }
+    let Some(p) = game.native_player() else { return };
+    let [x, y] = minimap_rect(game, batch, corner, size);
+    let (cx, cy) = (x + size / 2.0, y + size / 2.0);
+    let half = size / 2.0 - 3.0;
+    // When the map turns with the player, dots turn the other way.
+    let rot = if rotate { -yaw as f64 } else { 0.0 };
+    let (s, c) = rot.to_radians().sin_cos();
+    let mut clamp = |dx: f32, dz: f32| -> Option<[f32; 2]> {
+        let len = (dx * dx + dz * dz).sqrt();
+        if len > half {
+            if len < 0.001 {
+                return None;
+            }
+            let f = half / len;
+            Some([cx + dx * f, cy + dz * f])
+        } else {
+            Some([cx + dx, cy + dz])
+        }
+    };
+    for m in game.mobs.iter().filter(|m| !m.removed && !m.invisible) {
+        let dx = ((m.position.x - p.position.x) / bpp) as f32;
+        let dz = ((m.position.z - p.position.z) / bpp) as f32;
+        // Map-north-up: the map's screen up is -Z. Rotate when turning.
+        let (rx, rz) = if rotate {
+            (dx * c - dz * s, dx * s + dz * c)
+        } else {
+            (dx, dz)
+        };
+        let Some(at) = clamp(rx, rz) else { continue };
+        let is_player = game.remote_player_uuid(m.id).is_some();
+        let argb = if is_player {
+            0xFF_FF_FF
+        } else {
+            dot_color(&m.kind.id)
+        };
+        radar_dot(game, batch, at, argb, is_player);
+    }
+    // Dropped items, smaller and cyan.
+    for item in game.dropped.iter() {
+        let dx = ((item.position.x - p.position.x) / bpp) as f32;
+        let dz = ((item.position.z - p.position.z) / bpp) as f32;
+        let (rx, rz) = if rotate {
+            (dx * c - dz * s, dx * s + dz * c)
+        } else {
+            (dx, dz)
+        };
+        let Some(at) = clamp(rx, rz) else { continue };
+        radar_dot(game, batch, at, 0x53_F2_E8, false);
+    }
+}
+
 // ---------------- world data persistence ----------------
 
 /// The game folder (the working directory): saves, and Xaero's data roots.
@@ -1146,6 +1283,36 @@ pub(super) fn screen_render_post(
             }
             game.native_fill(batch, [px - 3.0, py - 3.0, 6.0, 6.0], w.wp.color.argb());
             game.native_text(batch, &w.wp.name, [px + 5.0, py - 4.0], 0xFF_FF_FF, true);
+        }
+
+        // Radar dots on the map, in the same projection as the markers.
+        if s.minimap.radar
+            && let Some(pl) = game.native_player()
+        {
+            let half_x = span_x / 2.0;
+            let half_z = span_z / 2.0;
+            let dot = |batch: &mut horizon_client::hud::HudBatch, wx: f64, wz: f64, argb: u32, big: bool| {
+                let dx = (wx - pl.x) as f32 / map.blocks_per_pixel as f32;
+                let dz = (wz - pl.z) as f32 / map.blocks_per_pixel as f32;
+                let px2 = rx + rw / 2.0 + dx;
+                let py2 = ry + rh / 2.0 + dz;
+                if px2 < rx - 4.0 || py2 < ry - 4.0 || px2 > rx + rw + 4.0 || py2 > ry + rh + 4.0 {
+                    return;
+                }
+                let _ = (half_x, half_z);
+                radar_dot(game, batch, [px2, py2], argb, big);
+            };
+            for m in game.mobs.iter().filter(|m| !m.removed && !m.invisible) {
+                let argb = if game.remote_player_uuid(m.id).is_some() {
+                    0xFF_FF_FF
+                } else {
+                    dot_color(&m.kind.id)
+                };
+                dot(batch, m.position.x, m.position.z, argb, game.remote_player_uuid(m.id).is_some());
+            }
+            for item in game.dropped.iter() {
+                dot(batch, item.position.x, item.position.z, 0x53_F2_E8, false);
+            }
         }
 
         // Status line: coordinates and scale.
