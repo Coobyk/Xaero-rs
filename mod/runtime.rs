@@ -644,6 +644,10 @@ pub struct State {
     pub dimension: &'static str,
     /// Seconds since the last periodic save.
     pub save_timer: f32,
+    /// The death screen was up last frame (edge detection for deathpoints).
+    pub was_dead: bool,
+    /// The last position while alive: where a deathpoint goes.
+    pub last_alive: Option<[f64; 3]>,
 }
 
 impl State {
@@ -662,6 +666,8 @@ impl State {
             view_h: 300.0,
             dimension: game.native_dimension(),
             save_timer: 0.0,
+            was_dead: false,
+            last_alive: None,
         };
         let get = |key: &str| game.native_setting(ID, key);
         if get("minimap_enabled").is_some() {
@@ -1101,6 +1107,43 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
             }
         }
         s.ensure_waypoints(game);
+        // Deathpoints: remember where we were alive; the death screen coming
+        // up records one there. Covers singleplayer, LAN and servers alike.
+        match game.native_player() {
+            Some(p) if game.screen != crate::game::Screen::Dead => {
+                s.last_alive = Some([p.x, p.y, p.z]);
+            }
+            _ => {}
+        }
+        let dead = game.screen == crate::game::Screen::Dead;
+        if dead && !s.was_dead
+            && let Some(at) = s.last_alive
+        {
+            let mut wp = Waypoint::new(
+                "Death",
+                at[0] as i64,
+                at[1] as i64,
+                at[2] as i64,
+                WaypointColor::from_index(0),
+            );
+            wp.symbol = "D".to_owned();
+            wp.set = "gui.xaero_deathpoint".to_owned();
+            let mut sw = StoredWaypoint::simple(wp);
+            sw.kind = 1;
+            sw.visibility = 1;
+            sw.destination = true;
+            // The previous latest death becomes an old one.
+            for old in &mut s.waypoints {
+                if old.kind == 1 {
+                    old.kind = 2;
+                    old.wp.set = "gui.xaero_deathpoint_old".to_owned();
+                    old.wp.name = "Death (old)".to_owned();
+                }
+            }
+            s.waypoints.insert(0, sw);
+            s.save_waypoints(game);
+        }
+        s.was_dead = dead;
         // Periodic save, so a crash loses at most half a minute of exploring.
         s.save_timer += 0.5;
         if s.save_timer >= 30.0 {
@@ -1493,38 +1536,10 @@ pub(super) fn settings_click(game: &mut crate::game::Game<'_>, mod_id: &str, but
     });
 }
 
-pub(super) fn player_died(game: &mut crate::game::Game<'_>, _player: u128, _cause: Option<&str>) {
-    if !game.native_on(ID) || game.native_player().is_none() {
-        return;
-    }
-    let at = game.native_player().map(|p| [p.x as i64, p.y as i64, p.z as i64]);
-    with_mut(game, |s, game| {
-        s.ensure_waypoints(game);
-        // The previous "latest death" becomes an old deathpoint.
-        for w in &mut s.waypoints {
-            if w.kind == 1 {
-                w.kind = 2;
-                w.wp.set = "gui.xaero_deathpoint_old".to_owned();
-                w.wp.name = "gui.xaero_deathpoint_old".to_owned();
-            }
-        }
-        if let Some(at) = at {
-            let mut wp = Waypoint::new(
-                "gui.xaero_deathpoint",
-                at[0],
-                at[1],
-                at[2],
-                WaypointColor::from_index(0),
-            );
-            wp.symbol = "D".to_owned();
-            wp.set = "gui.xaero_deathpoint".to_owned();
-            wp.enabled = true;
-            let mut sw = StoredWaypoint::simple(wp);
-            sw.kind = 1;
-            s.waypoints.insert(0, sw);
-        }
-        s.save_waypoints(game);
-    });
+pub(super) fn player_died(_game: &mut crate::game::Game<'_>, _player: u128, _cause: Option<&str>) {
+    // Deathpoints are recorded client-side in the frame hook (the death
+    // screen's edge), which covers servers too; the server-side hook has no
+    // client position to record.
 }
 
 pub(super) fn list(mods: &mut Vec<NativeMod>) {
