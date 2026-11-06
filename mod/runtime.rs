@@ -403,7 +403,7 @@ fn ring_offsets(ring: i32) -> Vec<(i32, i32)> {
 fn chunk_ready(chunk: &std::sync::Arc<horizon_client::chunk::Chunk>, air: u32) -> bool {
     (0..chunk.sections.len())
         .rev()
-        .any(|s| (0..16).any(|x| chunk.get(x, chunk.min_y() + s * 16, 0) != air))
+        .any(|s| (0..16).any(|x| chunk.get(x, chunk.min_y() + s as i32 * 16, 0) != air))
         || chunk.world_surface(0, 0, |id| id == air) > chunk.min_y()
 }
 
@@ -436,10 +436,11 @@ impl TileStore {
         let chunk = region
             .chunks
             .iter()
-            .find(|c| c.at.0 == rcx as u8 && c.at.1 == rcz as u8)?;
+            .find(|c| c.at.0 == rcx as u8 && c.at.1 == rcz as u8)?
+            .clone();
         let tx = (rcx % 4) as usize;
         let tz = (rcz % 4) as usize;
-        let tile = chunk.tiles.get(tz * 4 + tx)?.as_ref()?;
+        let tile = chunk.tiles.get(tz * 4 + tx)?.clone();
         let facts = game.res.facts();
         let biomes = game.res.biomes();
         let mut out = MapTile::empty();
@@ -764,7 +765,7 @@ fn our_screen(game: &crate::game::Game<'_>, screen: &NativeScreenView<'_>) -> bo
 
 /// The game folder (the working directory): saves, and Xaero's data roots.
 pub(super) fn game_dir(_game: &crate::game::Game<'_>) -> std::path::PathBuf {
-    crate::game::options::game_dir()
+    std::env::current_dir().unwrap_or_default()
 }
 
 impl State {
