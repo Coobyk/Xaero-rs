@@ -9,8 +9,8 @@ use std::cell::RefCell;
 
 use xaero_rs_engine::{Waypoint, WaypointColor};
 
-use crate::mod_api::{Corner, NativeMinimap, NativeMod, NativeScreenView};
-use crate::world_primitives::WorldPrimitives;
+use horizon_client::mod_api::{Corner, NativeMinimap, NativeMod, NativeScreenView};
+use horizon_client::world_primitives::WorldPrimitives;
 
 pub const ID: &str = "xaero_rs";
 pub const TITLE: &str = "Xaero-rs";
@@ -384,7 +384,7 @@ pub fn world_primitives(
 
 pub fn screen_render_post(
     game: &crate::game::Game<'_>,
-    batch: &mut crate::hud::HudBatch,
+    batch: &mut horizon_client::hud::HudBatch,
     screen: &NativeScreenView<'_>,
 ) {
     if !our_screen(game, screen) {

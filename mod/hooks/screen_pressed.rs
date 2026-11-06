@@ -1,6 +1,6 @@
 fn xaero_rs_screen_pressed(
     game: &crate::game::Game<'_>,
-    screen: &crate::mod_api::NativeScreenView<'_>,
+    screen: &crate::game::native_hooks::NativeScreenView<'_>,
     button: i32,
     canceled: &mut bool,
 ) -> core::ops::ControlFlow<()> {
