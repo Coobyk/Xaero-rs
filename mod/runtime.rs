@@ -61,7 +61,7 @@ impl MapView {
         Self {
             center_x,
             center_z,
-            blocks_per_pixel: 4.0,
+            blocks_per_pixel: 1.0,
             dragging: None,
             dirty: true,
         }
@@ -863,6 +863,11 @@ pub(super) fn hud(
     let (s, c) = rot.to_radians().sin_cos();
     let mut clamp = |dx: f64, dz: f64| -> Option<[f32; 2]> {
         let len = (dx * dx + dz * dz).sqrt();
+        if len > half * 2.0 {
+            // Far beyond the map: hidden, not clamped (Xaero keeps the rim
+            // clean; the dots hug the edge only when close to it).
+            return None;
+        }
         let (dx, dz) = if len > half && len > 0.001 {
             let f = half / len;
             (dx * f, dz * f)
@@ -911,6 +916,13 @@ pub(super) fn game_dir(_game: &crate::game::Game<'_>) -> std::path::PathBuf {
 }
 
 impl State {
+    /// Marks the composed map image stale.
+    pub(super) fn map_dirty(&mut self) {
+        if let Some(map) = &mut self.map {
+            map.dirty = true;
+        }
+    }
+
     /// Loads this dimension's waypoints once (Xaero's file, both roots).
     pub(super) fn ensure_waypoints(&mut self, game: &crate::game::Game<'_>) {
         if self.wp_loaded {
@@ -1257,9 +1269,13 @@ pub(super) fn screen_render_post(
 
     with(game, |s| {
         let Some(map) = &s.map else { return };
-        // Remember the window's GUI size for the next compose (in `frame`).
-        s.view_w = batch.width;
-        s.view_h = batch.height;
+        // Remember the window's GUI size for the next compose (in `frame`);
+        // a changed size invalidates the composed image.
+        if (s.view_w - batch.width).abs() > 0.5 || (s.view_h - batch.height).abs() > 0.5 {
+            s.view_w = batch.width;
+            s.view_h = batch.height;
+            s.map_dirty();
+        }
         // Cover the window with the composed terrain image.
         let _ = game.native_sprite(
             batch,
