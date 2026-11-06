@@ -440,12 +440,14 @@ impl TileStore {
             .clone();
         let tx = (rcx % 4) as usize;
         let tz = (rcz % 4) as usize;
-        let tile = chunk.tiles.get(tz * 4 + tx)?.clone()?;
+        // Region tiles are tx-outer, ours are tz-major indexed.
+        let tile = chunk.tiles.get(tx * 4 + tz)?.clone()?;
         let facts = game.res.facts();
         let biomes = game.res.biomes();
         let mut out = MapTile::empty();
         for slot in 0..256usize {
-            let px: &RegionPixel = &tile.pixels[slot];
+            // Region pixels are x-major; our slots z-major.
+            let px: &RegionPixel = &tile.pixels[(slot % 16) * 16 + slot / 16];
             out.height[slot] = px.height;
             out.depth[slot] = px
                 .top_height
@@ -527,12 +529,17 @@ impl TileStore {
         ]
     }
 
-    /// Exports one tile as a region tile (Xaero 7.8 stream data).
+    /// Exports one tile as a region tile (Xaero 7.8 stream data). The
+    /// stream's pixels are x-major (`pixel = x*16 + z`); our tiles are
+    /// z-major (`slot = z*16 + x`), like the game minimap's.
     fn export_tile(&self, game: &crate::game::Game<'_>, t: &MapTile) -> RegionTile {
         let facts = game.res.facts();
         let biomes = game.res.biomes();
-        let pixels = (0..256usize)
-            .map(|slot| RegionPixel {
+        let mut pixels = vec![RegionPixel::default(); 256];
+        for slot in 0..256usize {
+            let x = slot % 16;
+            let z = slot / 16;
+            pixels[x * 16 + z] = RegionPixel {
                 height: t.height[slot],
                 top_height: Some((t.height[slot] + i16::from(t.depth[slot])).clamp(0, 255) as u8),
                 light: 15,
@@ -551,8 +558,8 @@ impl TileStore {
                         .map(|b| b.name.clone())
                         .unwrap_or_else(|| "minecraft:plains".to_owned()),
                 ),
-            })
-            .collect();
+            };
+        }
         RegionTile {
             pixels,
             interp_version: 1,
@@ -590,8 +597,8 @@ impl TileStore {
             for rcz in 0..8i32 {
                 let mut tiles: Vec<Option<RegionTile>> = Vec::with_capacity(16);
                 let mut any = false;
-                for tz in 0..4i32 {
-                    for tx in 0..4i32 {
+                for tx in 0..4i32 {
+                    for tz in 0..4i32 {
                         let cx = rx * 32 + rcx * 4 + tx;
                         let cz = rz * 32 + rcz * 4 + tz;
                         match self.tiles.get(&(cx, cz)) {

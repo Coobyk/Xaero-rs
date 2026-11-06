@@ -744,6 +744,49 @@ mod tests {
     }
 
     #[test]
+    fn pixel_order_is_x_major() {
+        // Asymmetric pixels catch a transpose: (x=0,z=1) differs from
+        // (x=1,z=0), and the chunk's (tx=0,tz=1) tile from (tx=1,tz=0).
+        let mk = |h: i16, b: &str| Pixel {
+            height: h,
+            biome: Some(b.to_owned()),
+            ..Default::default()
+        };
+        let mut pixels = vec![mk(64, "minecraft:plains"); 256];
+        // In region order: pixel x=0,z=1 -> index 1; x=1,z=0 -> index 16.
+        pixels[1] = mk(100, "minecraft:desert");
+        pixels[16] = mk(-64, "minecraft:ocean");
+        let tile_a = Tile {
+            pixels,
+            interp_version: 1,
+            cave_start: i32::MAX,
+            cave_depth: 30,
+        };
+        let tile_b = Tile {
+            pixels: vec![mk(90, "minecraft:savanna"); 256],
+            interp_version: 1,
+            cave_start: i32::MAX,
+            cave_depth: 30,
+        };
+        let region = Region {
+            chunks: vec![Chunk {
+                at: (0, 0),
+                tiles: vec![Some(tile_a), Some(tile_b), None, None, None, None, None, None, None, None, None, None, None, None, None, None],
+            }],
+            truncated: false,
+        };
+        let back = decode_region(&encode_region(&region)).expect("decodes");
+        let t = back.chunks[0].tiles[0].as_ref().unwrap();
+        // x=0,z=1 is pixel index 1.
+        assert_eq!(t.pixel(0, 1).height, 100);
+        // x=1,z=0 is pixel index 16.
+        assert_eq!(t.pixel(1, 0).height, -64);
+        // Tile (tx=0, tz=1) is region index 1.
+        let t1 = back.chunks[0].tiles[1].as_ref().unwrap();
+        assert_eq!(t1.pixel(0, 0).height, 90);
+    }
+
+    #[test]
     fn negative_heights_round_trip() {
         let region = Region {
             chunks: vec![Chunk {
