@@ -677,7 +677,7 @@ fn compose(s: &mut State, w: f32, h: f32) {
                 tile = store.tiles.get(&key);
             }
             let i = (py * 1024 + px) * 4;
-            let Some(t) = tile {
+            let Some(t) = tile else {
                 img[i] = 20;
                 img[i + 1] = 20;
                 img[i + 2] = 20;
