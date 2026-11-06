@@ -619,7 +619,7 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
                 let vcx = map.center_x.div_euclid(16.0) as i32;
                 let vcz = map.center_z.div_euclid(16.0) as i32;
                 let span = (s.view_w.max(s.view_h) as f64 * map.blocks_per_pixel / 16.0).ceil() as i32 + 1;
-                ((pcx + vcx) / 2, (pcz + vcz) / 2, (span / 2 + 1 + (pcx.abs_diff(vcx) + pcz.abs_diff(vcz)) / 2).clamp(2, 24))
+                ((pcx + vcx) / 2, (pcz + vcz) / 2, (span / 2 + 1 + ((pcx.abs_diff(vcx) + pcz.abs_diff(vcz)) as i32) / 2).clamp(2, 24))
             }
             None => (pcx, pcz, 8),
         };
