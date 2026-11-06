@@ -457,6 +457,64 @@ const GRASS_TINTS: [&str; 6] = [
 
 
 impl TileStore {
+    /// A block state id whose facts carry `name`.
+    fn color_by_name(
+        &self,
+        name: &str,
+        facts: &horizon_client::blocks::BlockFacts,
+    ) -> Option<u8> {
+        facts
+            .states
+            .iter()
+            .position(|f| &*f.name == name)
+            .map(|i| self.color[i])
+    }
+
+    /// The map RGB for an imported pixel: map colour of its state, tinted by
+    /// its biome.
+    fn import_rgb(
+        &self,
+        game: &crate::game::Game<'_>,
+        px: &RegionPixel,
+    ) -> [u8; 3] {
+        let facts = game.res.facts();
+        let biomes = game.res.biomes();
+        let name = px.state.as_deref().unwrap_or("minecraft:grass_block");
+        let id = self
+            .color_by_name(name, facts)
+            .map(usize::from)
+            .filter(|c| *c != 0)
+            .unwrap_or(1);
+        let col = horizon_client::blocks::MAP_COLORS[id.min(horizon_client::blocks::MAP_COLORS.len() - 1)];
+        let [r, g, b] = unpack(col);
+        let tint: u32 = if GRASS_TINTS.contains(&name) {
+            px.biome
+                .as_deref()
+                .and_then(|b| biomes.index.get(b).copied())
+                .map(|bi| biomes.grass(bi, 0.0, 0.0))
+                .unwrap_or(0xFF_FF_FF)
+        } else if name.ends_with("_leaves") || name == "minecraft:vine" {
+            px.biome
+                .as_deref()
+                .and_then(|b| biomes.index.get(b).copied())
+                .map(|bi| biomes.get(bi).foliage)
+                .unwrap_or(0xFF_FF_FF)
+        } else if name == "minecraft:water" {
+            px.biome
+                .as_deref()
+                .and_then(|b| biomes.index.get(b).copied())
+                .map(|bi| biomes.get(bi).water)
+                .unwrap_or(0xFF_FF_FF)
+        } else {
+            0xFF_FF_FF
+        };
+        [
+            ((u32::from(r) * (tint >> 16 & 255)) >> 8) as u8,
+            ((u32::from(g) * (tint >> 8 & 255)) >> 8) as u8,
+            ((u32::from(b) * (tint & 255)) >> 8) as u8,
+        ]
+    }
+
     /// Exports one tile as a region tile (Xaero 7.8 stream data). The
     /// stream's pixels are x-major (`pixel = x*16 + z`); our tiles are
     /// z-major (`slot = z*16 + x`), like the game minimap's.
@@ -1088,8 +1146,13 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
                 (vcx, vcz, half_cx, half_cz)
             }
             None => {
-                let p = game.native_player();
-                (p.map(|p| p.x.div_euclid(16.0) as i32).unwrap_or(0), p.map(|p| p.z.div_euclid(16.0) as i32).unwrap_or(0), 8, 8)
+                let at = game.native_player().map(|p| (p.x, p.z));
+                (
+                    at.map(|a| a.0.div_euclid(16.0) as i32).unwrap_or(0),
+                    at.map(|a| a.1.div_euclid(16.0) as i32).unwrap_or(0),
+                    8,
+                    8,
+                )
             }
         };
         if s.store.update(game, vcx, vcz, half_cx, half_cz, std::time::Duration::from_micros(2500)) {
