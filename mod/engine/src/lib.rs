@@ -3,6 +3,7 @@
 //! dependencies must already be in Horizon's `Cargo.lock`.
 
 pub mod waypoint;
+pub mod xaero;
 
 pub use waypoint::{Waypoint, WaypointColor, WAYPOINT_COLORS};
 

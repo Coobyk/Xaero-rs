@@ -5,3 +5,5 @@ edition = "2021"
 description = "Game-independent core of Xaero-rs: waypoint model, Xaero file formats, map tile store, colors"
 
 [dependencies]
+flate2 = "1"
+crc32fast = "1"
