@@ -536,26 +536,23 @@ pub(super) fn screen_key(
     if !our_screen(game, screen) {
         return;
     }
-    // ESC stays uncancelled: the game closes the screen.
-    if key == "key.keyboard.escape" {
+    let _ = repeat;
+    // Cancel ONLY what we handle. A cancelled press never reaches the
+    // screens or `native_key`, so swallowing everything here would eat our
+    // own toggles (M, Y, U, B). ESC passes so the game closes the screen.
+    let zoom_in = matches!(key, "key.keyboard.equal" | "key.keyboard.keypad.add");
+    let zoom_out = matches!(key, "key.keyboard.minus" | "key.keyboard.keypad.subtract");
+    if !(zoom_in || zoom_out) {
         return;
     }
+    *canceled = true;
     with(game, |s| {
         if let Some(map) = &mut s.map {
-            let mut step = |inward: bool| {
-                let factor = if inward { 0.8 } else { 1.25 };
-                map.blocks_per_pixel = (map.blocks_per_pixel * factor).clamp(0.05, 64.0);
-                map.dirty = true;
-            };
-            match key {
-                "key.keyboard.equal" | "key.keyboard.keypad.add" => step(true),
-                "key.keyboard.minus" | "key.keyboard.keypad.subtract" => step(false),
-                _ => {}
-            }
+            let factor = if zoom_in { 0.8 } else { 1.25 };
+            map.blocks_per_pixel = (map.blocks_per_pixel * factor).clamp(0.05, 64.0);
+            map.dirty = true;
         }
     });
-    let _ = repeat;
-    *canceled = true;
 }
 
 pub(super) fn screen_char(
@@ -567,9 +564,8 @@ pub(super) fn screen_char(
     if !our_screen(game, screen) {
         return;
     }
-    // No text fields yet; swallow characters so nothing else takes them.
+    // No text fields yet; nothing to take the characters, so let them pass.
     let _ = c;
-    *canceled = true;
 }
 
 pub(super) fn settings(game: &mut crate::game::Game<'_>, mod_id: &str, buttons: &mut Vec<String>) {
