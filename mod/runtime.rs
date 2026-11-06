@@ -108,12 +108,286 @@ impl MinimapSettings {
     }
 }
 
+// ---------------- map tile store ----------------
+
+/// One 16x16-chunk column scan: final (biome-tinted) map RGB per column,
+/// surface height and water depth. Shading is applied at compose time.
+pub(super) struct MapTile {
+    rgb: [[u8; 3]; 256],
+    height: [i16; 256],
+    depth: [u8; 256],
+    /// The column's surface is water (map colour WATER): shade by depth.
+    water: [bool; 256],
+    scanned: std::time::Instant,
+    revision: u64,
+}
+
+impl MapTile {
+    fn empty() -> Self {
+        Self {
+            rgb: [[20, 20, 20]; 256],
+            height: [0; 256],
+            depth: [0; 256],
+            water: [false; 256],
+            scanned: std::time::Instant::now(),
+            revision: 0,
+        }
+    }
+}
+
+/// `MapColor` ids the scanner substitutes for fluids (the game's own).
+const WATER: u8 = 12;
+const LAVA: u8 = 4;
+const RESCAN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Xaero-style map colour brightness modifiers (vanilla map shading).
+const BRIGHTNESS: [u32; 4] = [180, 220, 255, 135];
+
+pub(super) struct TileStore {
+    tiles: std::collections::HashMap<(i32, i32), MapTile>,
+    /// Per block state: map colour id and the palette flags (0/1 water, 2
+    /// lava, |4 air, |8 sturdy top) - the game minimap's Palette.
+    color: Vec<u8>,
+    flags: Vec<u8>,
+}
+
+impl TileStore {
+    fn new() -> Self {
+        Self {
+            tiles: Default::default(),
+            color: Vec::new(),
+            flags: Vec::new(),
+        }
+    }
+
+    fn ensure_palette(&mut self, facts: &horizon_client::blocks::BlockFacts) {
+        if !self.color.is_empty() {
+            return;
+        }
+        self.color.reserve(facts.states.len());
+        self.flags.reserve(facts.states.len());
+        for (i, f) in facts.states.iter().enumerate() {
+            self.color.push(f.map_color);
+            let mut b = match f.fluid {
+                horizon_client::blocks::Fluid::None => 0,
+                horizon_client::blocks::Fluid::Water => 1,
+                horizon_client::blocks::Fluid::Lava => 2,
+            };
+            if facts.is_air(horizon_world::registry::BlockStateId(i as u32)) {
+                b |= 4;
+            }
+            if f.sturdy_full >> 1 & 1 != 0 {
+                b |= 8;
+            }
+            self.flags.push(b);
+        }
+    }
+
+    /// Scans missing/stale tiles nearest-first under a time budget; true when
+    /// any tile's pixels changed. Mirrors the game minimap's update loop.
+    fn update(
+        &mut self,
+        game: &crate::game::Game<'_>,
+        center: (i32, i32),
+        radius: i32,
+        budget: std::time::Duration,
+    ) -> bool {
+        if self.color.is_empty() {
+            return false;
+        }
+        let started = std::time::Instant::now();
+        let world = &game.world;
+        let air = world.air.0;
+        self.tiles.retain(|k, _| {
+            (k.0 - center.0).abs() <= radius + 2
+                && (k.1 - center.1).abs() <= radius + 2
+                && world.chunks.contains_key(k)
+        });
+        let mut changed = false;
+        for ring in 0..=radius {
+            for (dx, dz) in ring_offsets(ring) {
+                let key = (center.0 + dx, center.1 + dz);
+                let Some(chunk) = world.chunks.get(&key) else {
+                    continue;
+                };
+                let stale = match self.tiles.get(&key) {
+                    None => true,
+                    Some(t) => t.revision != world.revision && t.scanned.elapsed() >= RESCAN,
+                };
+                if !stale {
+                    continue;
+                }
+                let tile = self.scan_tile(game, chunk, air, world.revision);
+                let before = self.tiles.get(&key);
+                changed |= before.is_none_or(|t| t.rgb != tile.rgb);
+                self.tiles.insert(key, tile);
+                if started.elapsed() >= budget {
+                    return changed;
+                }
+            }
+        }
+        changed
+    }
+
+    /// One chunk column scan with biome tints (Xaero-style colours).
+    fn scan_tile(
+        &self,
+        game: &crate::game::Game<'_>,
+        chunk: &std::sync::Arc<horizon_client::chunk::Chunk>,
+        air: u32,
+        revision: u64,
+    ) -> MapTile {
+        let mut tile = MapTile::empty();
+        let facts = game.res.facts();
+        let biomes = game.res.biomes();
+        let wx0 = chunk.x * 16;
+        let wz0 = chunk.z * 16;
+        for z in 0..16i32 {
+            for x in 0..16i32 {
+                let slot = (z * 16 + x) as usize;
+                let top = chunk.world_surface(x, z, |id| id == air);
+                let bottom = chunk.min_y();
+                let mut y = top;
+                let mut color = 0u8;
+                let mut depth = 0u8;
+                while y > bottom {
+                    let state = chunk.get(x, y, z);
+                    let (c, flags) = self.get(state);
+                    if c == 0 {
+                        y -= 1;
+                        continue;
+                    }
+                    let fluid = flags & 3;
+                    if fluid != 0 {
+                        let mut below = y - 1;
+                        while below > bottom && self.get(chunk.get(x, below, z)).1 & 3 != 0 {
+                            depth = depth.saturating_add(1);
+                            below -= 1;
+                        }
+                        depth = depth.saturating_add(1);
+                        if flags & 8 == 0 {
+                            color = if fluid == 2 { LAVA } else { WATER };
+                        } else {
+                            color = c;
+                        }
+                    } else {
+                        color = c;
+                    }
+                    break;
+                }
+                tile.height[slot] = y as i16;
+                tile.depth[slot] = depth;
+                tile.water[slot] = color == WATER;
+                tile.rgb[slot] = if color == 0 {
+                    [20, 20, 20]
+                } else {
+                    self.tinted(facts, biomes, chunk, x, y, z, color, wx0, wz0)
+                };
+            }
+        }
+        tile.revision = revision;
+        tile
+    }
+
+    #[inline]
+    fn get(&self, id: u32) -> (u8, u8) {
+        let i = id as usize;
+        (
+            self.color.get(i).copied().unwrap_or(0),
+            self.flags.get(i).copied().unwrap_or(4),
+        )
+    }
+
+    /// The map colour for a column, multiplied by the biome tint for the
+    /// tintable surfaces (grass, foliage, water), as Xaero's map does.
+    fn tinted(
+        &self,
+        facts: &horizon_client::blocks::BlockFacts,
+        biomes: &std::sync::Arc<horizon_client::biome::Biomes>,
+        chunk: &horizon_client::chunk::Chunk,
+        x: i32,
+        y: i32,
+        z: i32,
+        color: u8,
+        wx0: i32,
+        wz0: i32,
+    ) -> [u8; 3] {
+        let id = usize::from(color);
+        if id == 0 || id >= horizon_client::blocks::MAP_COLORS.len() {
+            return [20, 20, 20];
+        }
+        let col = horizon_client::blocks::MAP_COLORS[id];
+        let state = chunk.block(x, y, z);
+        let Some(f) = facts.states.get(state.0 as usize) else {
+            return unpack(col);
+        };
+        let name: &str = &f.name;
+        let tint: u32 = if GRASS_TINTS.contains(&name) {
+            let b = chunk.biome(x, y, z);
+            biomes.grass(b, f64::from(wx0 + x), f64::from(wz0 + z))
+        } else if name.ends_with("_leaves") || name == "minecraft:vine" {
+            biomes.get(chunk.biome(x, y, z)).foliage
+        } else if name == "minecraft:water" {
+            biomes.get(chunk.biome(x, y, z)).water
+        } else {
+            0xFF_FF_FF
+        };
+        let [r, g, b] = unpack(col);
+        [
+            ((u32::from(r) * (tint >> 16 & 255)) >> 8) as u8,
+            ((u32::from(g) * (tint >> 8 & 255)) >> 8) as u8,
+            ((u32::from(b) * (tint & 255)) >> 8) as u8,
+        ]
+    }
+}
+
+fn unpack(col: u32) -> [u8; 3] {
+    [(col >> 16 & 255) as u8, (col >> 8 & 255) as u8, (col & 255) as u8]
+}
+
+/// Blocks whose map colour follows the biome's grass colour.
+const GRASS_TINTS: [&str; 6] = [
+    "minecraft:grass_block",
+    "minecraft:short_grass",
+    "minecraft:tall_grass",
+    "minecraft:fern",
+    "minecraft:large_fern",
+    "minecraft:bush",
+];
+
+/// Chunk ring offsets, nearest first (the game minimap's approach).
+fn ring_offsets(ring: i32) -> Vec<(i32, i32)> {
+    if ring == 0 {
+        return vec![(0, 0)];
+    }
+    let mut out = Vec::with_capacity(8 * ring as usize);
+    for i in -(ring - 1)..=ring {
+        out.push((i, -ring));
+        out.push((i, ring));
+    }
+    for i in -ring..=ring {
+        out.push((-ring, i));
+        out.push((ring, i));
+    }
+    out
+}
+
 pub struct State {
     pub minimap: MinimapSettings,
     pub waypoints: Vec<Waypoint>,
     /// Colour index for the next waypoint created with Y.
     pub next_color: usize,
     pub map: Option<MapView>,
+    /// Explored terrain, per chunk.
+    pub store: TileStore,
+    /// The composed 1024x1024 map image and whether it needs an upload.
+    pub img: Vec<u8>,
+    pub needs_upload: bool,
+    /// The last drawn window size in GUI pixels (from screen_render_post).
+    pub view_w: f32,
+    pub view_h: f32,
+    /// The dimension the store was built for.
+    pub dimension: &'static str,
 }
 
 impl State {
@@ -123,6 +397,12 @@ impl State {
             waypoints: Vec::new(),
             next_color: 0,
             map: None,
+            store: TileStore::new(),
+            img: vec![0; 1024 * 1024 * 4],
+            needs_upload: false,
+            view_w: 480.0,
+            view_h: 300.0,
+            dimension: game.native_dimension(),
         };
         let get = |key: &str| game.native_setting(ID, key);
         if get("minimap_enabled").is_some() {
@@ -316,58 +596,142 @@ pub(super) fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
 }
 
 pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Duration) {
-    if game.native_mod_screen() != Some(ID) || !game.native_on(ID) {
+    if !game.native_on(ID) || game.native_player().is_none() {
         return;
     }
-    with_mut(game, |_, _| {});
-    // Upload the composed map image when it changed. `native_mod_image`
-    // needs `&mut self`, so it happens on the frame hook; drawing only
-    // reads it. Placeholder terrain: a chunk-parity checkerboard. The real
-    // tile pipeline replaces this.
-    let span = rect_span();
-    STATE.with_borrow_mut(|slot| {
-        let Some(s) = slot.as_mut() else { return };
-        let Some(map) = &mut s.map else { return };
-        if !map.dirty {
-            return;
+    let mut compose_upload = false;
+    with_mut(game, |s, game| {
+        // Dimension changed: the store belongs to the old dimension.
+        let dim = game.native_dimension();
+        if dim != s.dimension {
+            s.dimension = dim;
+            s.store.tiles.clear();
+            s.needs_upload = true;
+            if let Some(map) = &mut s.map {
+                map.dirty = true;
+            }
         }
-        let img = compose_test(map, span);
-        if game.native_mod_image(1024, 1024, &img) {
-            map.dirty = false;
+        let px = game.native_player().map(|p| (p.x, p.z));
+        let (pcx, pcz) = px.map(|p| (p.0.div_euclid(16.0) as i32, p.1.div_euclid(16.0) as i32)).unwrap_or((0, 0));
+        // Scan around the view when it is open, else around the player.
+        let (ccx, ccz, radius) = match &s.map {
+            Some(map) => {
+                let vcx = map.center_x.div_euclid(16.0) as i32;
+                let vcz = map.center_z.div_euclid(16.0) as i32;
+                let span = (s.view_w.max(s.view_h) as f64 * map.blocks_per_pixel / 16.0).ceil() as i32 + 1;
+                ((pcx + vcx) / 2, (pcz + vcz) / 2, (span / 2 + 1 + (pcx.abs_diff(vcx) + pcz.abs_diff(vcz)) / 2).clamp(2, 24))
+            }
+            None => (pcx, pcz, 8),
+        };
+        if s.store.update(game, (ccx, ccz), radius, std::time::Duration::from_micros(2500)) {
+            if let Some(map) = &mut s.map {
+                map.dirty = true;
+            }
+        }
+        // Compose and upload while our screen is open; `native_mod_image`
+        // needs `&mut self`, so this is the one place it can happen.
+        let dirty = s.map.as_ref().is_some_and(|m| m.dirty);
+        if game.native_mod_screen() == Some(ID) && dirty {
+            compose(s, s.view_w.max(320.0), s.view_h.max(200.0));
+            compose_upload = true;
         }
     });
+    if compose_upload {
+        STATE.with_borrow_mut(|slot| {
+            let Some(s) = slot.as_mut() else { return };
+            if game.native_mod_image(1024, 1024, &s.img) {
+                s.needs_upload = false;
+                if let Some(map) = &mut s.map {
+                    map.dirty = false;
+                }
+            }
+        });
+    }
 }
 
-/// The visible world span in blocks, from the game's own GUI scale
-/// (physical pixels / GUI scale). Only the larger side matters for the
-/// placeholder composition.
-fn rect_span() -> f64 {
-    // A conservative 480x300 GUI-pixel window (auto GUI scale keeps the
-    // smaller side near 240-480); refined when the real pipeline lands.
-    480.0
-}
-
-fn compose_test(map: &MapView, span: f64) -> Vec<u8> {
-    let mut img = vec![0u8; 1024 * 1024 * 4];
-    let x0 = map.center_x - span / 2.0;
-    let z0 = map.center_z - span / 2.0;
-    let blocks_per_img_px = span / 1024.0;
+/// Composes the visible window (`w` x `h` GUI pixels, view `s.map`) into the
+/// 1024x1024 image: nearest tile sampling with vanilla-map height and
+/// water-depth shading.
+fn compose(s: &mut State, w: f32, h: f32) {
+    let Some(map) = s.map else { return };
+    let State { img, store, .. } = s;
+    let img = &mut img[..];
+    let span_x = f64::from(w) * map.blocks_per_pixel;
+    let span_z = f64::from(h) * map.blocks_per_pixel;
+    let x0 = map.center_x - span_x / 2.0;
+    let z0 = map.center_z - span_z / 2.0;
+    let per_px_x = span_x / 1024.0;
+    let per_px_z = span_z / 1024.0;
+    let mut last_key: (i32, i32) = (i32::MAX, i32::MAX);
+    let mut tile: Option<&MapTile> = None;
     for py in 0..1024usize {
-        let wz = z0 + py as f64 * blocks_per_img_px;
-        let chunk_z = wz.div_euclid(16.0);
+        let wz = z0 + (py as f64 + 0.5) * per_px_z;
+        let cz = wz.div_euclid(16.0) as i32;
+        let lz = wz.rem_euclid(16.0) as usize;
         for px in 0..1024usize {
-            let wx = x0 + px as f64 * blocks_per_img_px;
-            let chunk_x = wx.div_euclid(16.0);
-            let inside = ((chunk_x + chunk_z).rem_euclid(2.0)) == 0.0;
+            let wx = x0 + (px as f64 + 0.5) * per_px_x;
+            let cx = wx.div_euclid(16.0) as i32;
+            let key = (cx, cz);
+            if key != last_key {
+                last_key = key;
+                tile = store.tiles.get(&key);
+            }
             let i = (py * 1024 + px) * 4;
-            let (r, g, b) = if inside { (92, 148, 72) } else { (76, 128, 60) };
-            img[i] = r;
-            img[i + 1] = g;
-            img[i + 2] = b;
+            let Some(t) = tile {
+                img[i] = 20;
+                img[i + 1] = 20;
+                img[i + 2] = 20;
+                img[i + 3] = 255;
+                continue;
+            };
+            let lx = wx.rem_euclid(16.0) as usize;
+            let slot = lz * 16 + lx;
+            let [r, g, b] = t.rgb[slot];
+            let height = t.height[slot];
+            // North neighbour for the slope shading; the tile above when the
+            // column is the chunk's north edge.
+            let north = if lz > 0 {
+                t.height[(lz - 1) * 16 + lx]
+            } else {
+                store
+                    .tiles
+                    .get(&(cx, cz - 1))
+                    .map(|n| n.height[15 * 16 + lx])
+                    .unwrap_or(height)
+            };
+            let parity = (px ^ py) as i32;
+            let bright = brightness_idx(t.water[slot], t.depth[slot], height, north, parity);
+            let m = u32::from(BRIGHTNESS[bright]);
+            img[i] = ((u32::from(r) * m) / 255) as u8;
+            img[i + 1] = ((u32::from(g) * m) / 255) as u8;
+            img[i + 2] = ((u32::from(b) * m) / 255) as u8;
             img[i + 3] = 255;
         }
     }
-    img
+}
+
+/// The game minimap's brightness index: water by depth, land by the slope
+/// towards the lower north neighbour, dithered.
+fn brightness_idx(is_water: bool, depth: u8, height: i16, north: i16, parity: i32) -> usize {
+    let parity = f64::from(parity & 1);
+    if is_water {
+        let diff = f64::from(depth) * 0.1 + parity * 0.2;
+        return if diff < 0.5 {
+            2
+        } else if diff > 0.9 {
+            0
+        } else {
+            1
+        };
+    }
+    let diff = f64::from(height - north) * 4.0 / 5.0 + (parity - 0.5) * 0.4;
+    if diff > 0.6 {
+        2
+    } else if diff < -0.6 {
+        0
+    } else {
+        1
+    }
 }
 
 pub(super) fn minimap(game: &crate::game::Game<'_>, minimap: &mut Option<NativeMinimap>) {
@@ -409,8 +773,10 @@ pub(super) fn screen_render_post(
 
     with(game, |s| {
         let Some(map) = &s.map else { return };
-        // Cover the window with the composed image (placeholder pipeline:
-        // stretch; the real one uploads window-shaped patches).
+        // Remember the window's GUI size for the next compose (in `frame`).
+        s.view_w = batch.width;
+        s.view_h = batch.height;
+        // Cover the window with the composed terrain image.
         let _ = game.native_sprite(
             batch,
             "horizon/modimage",
@@ -418,13 +784,14 @@ pub(super) fn screen_render_post(
             [rx, ry, rw, rh],
         );
 
-        // Waypoint markers.
-        let span = rect_span();
-        let wx0 = map.center_x - span / 2.0;
-        let wz0 = map.center_z - span / 2.0;
+        // Waypoint markers, in the same projection the image used.
+        let span_x = f64::from(batch.width) * map.blocks_per_pixel;
+        let span_z = f64::from(batch.height) * map.blocks_per_pixel;
+        let wx0 = map.center_x - span_x / 2.0;
+        let wz0 = map.center_z - span_z / 2.0;
         for w in s.waypoints.iter().filter(|w| w.enabled) {
-            let px = rx + ((w.pos[0] as f64 - wx0) / span * rw as f64) as f32;
-            let py = ry + ((w.pos[2] as f64 - wz0) / span * rh as f64) as f32;
+            let px = rx + ((w.pos[0] as f64 - wx0) / span_x * rw as f64) as f32;
+            let py = ry + ((w.pos[2] as f64 - wz0) / span_z * rh as f64) as f32;
             if px < rx - 8.0 || py < ry - 8.0 || px > rx + rw + 8.0 || py > ry + rh + 8.0 {
                 continue;
             }
