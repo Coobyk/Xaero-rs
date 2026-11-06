@@ -534,11 +534,6 @@ fn zip_entries(zip: &[u8]) -> Option<ZipEntry> {
     // First central directory entry: signature PK\x01\x02.
     let cd = zip.get(cd_offset..)?;
     if cd.len() < 46 || cd[0..4] != [0x50, 0x4B, 0x01, 0x02] {
-        eprintln!(
-            "DBG cd bad: len {} sig {:02x?}",
-            cd.len(),
-            &cd[0..4.min(cd.len())]
-        );
         return None;
     }
     let method = u16::from_le_bytes([cd[10], cd[11]]);
@@ -550,19 +545,12 @@ fn zip_entries(zip: &[u8]) -> Option<ZipEntry> {
     let local_offset = u32::from_le_bytes([cd[42], cd[43], cd[44], cd[45]]) as usize;
     let name = String::from_utf8_lossy(&cd[46..46 + name_len]);
     if name != "region.xaero" {
-        eprintln!("DBG name {:?} name_len {}", name, name_len);
         return None;
     }
     // Local file header: signature PK\x03\x04; its own name/extra lengths
     // decide where the data starts (they may differ from the central one).
     let lh = zip.get(local_offset..)?;
     if lh.len() < 30 || lh[0..4] != [0x50, 0x4B, 0x03, 0x04] {
-        eprintln!(
-            "DBG lh bad: off {} len {} sig {:02x?}",
-            local_offset,
-            lh.len(),
-            &lh[0..4.min(lh.len())]
-        );
         return None;
     }
     let l_name = u16::from_le_bytes([lh[26], lh[27]]) as usize;
@@ -642,97 +630,6 @@ pub fn zip_region(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn debug_zip() {
-        use super::*;
-        let stream = encode_region(&sample_region());
-        let zipped = zip_region(&stream);
-        println!("zip len {}", zipped.len());
-        println!("tail: {:02x?}", &zipped[zipped.len() - 40..]);
-        let eocd = zipped
-            .windows(4)
-            .rposition(|w| w == [0x50, 0x4B, 0x05, 0x06]);
-        println!("eocd at {:?}", eocd);
-        let eocd = eocd.unwrap();
-        let cd_offset = u32::from_le_bytes([
-            zipped[eocd + 16],
-            zipped[eocd + 17],
-            zipped[eocd + 18],
-            zipped[eocd + 19],
-        ]) as usize;
-        println!("cd_offset {}", cd_offset);
-        println!("cd: {:02x?}", &zipped[cd_offset..cd_offset + 46]);
-        match zip_entries(&zipped) {
-            Some(e) => println!(
-                "entry ok: method {} comp {} uncomp {} start {}",
-                e.method, e.compressed_size, e.uncompressed_size, e.data_start
-            ),
-            None => println!("zip_entries -> None"),
-        }
-    }
-
-    fn grass_px(height: i16, biome: &str) -> Pixel {
-        Pixel {
-            height,
-            top_height: None,
-            light: 15,
-            cave: false,
-            state: None,
-            biome: Some(biome.to_owned()),
-        }
-    }
-
-    fn water_px(height: i16, top: u8, biome: &str) -> Pixel {
-        Pixel {
-            height,
-            top_height: Some(top),
-            light: 10,
-            cave: false,
-            state: Some("minecraft:water".to_owned()),
-            biome: Some(biome.to_owned()),
-        }
-    }
-
-    fn sample_region() -> Region {
-        let mut pixels: Vec<Pixel> = Vec::with_capacity(256);
-        for i in 0..256 {
-            pixels.push(if i % 7 == 0 {
-                water_px(60, 63, "minecraft:ocean")
-            } else {
-                grass_px(64 + (i % 5) as i16, "minecraft:plains")
-            });
-        }
-        Region {
-            chunks: vec![Chunk {
-                at: (0, 0),
-                tiles: vec![
-                    Some(Tile {
-                        pixels,
-                        interp_version: 1,
-                        cave_start: i32::MAX,
-                        cave_depth: 30,
-                    }),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ],
-            }],
-            truncated: false,
-        }
-    }
-
     #[test]
     fn debug_stream() {
         use super::*;
