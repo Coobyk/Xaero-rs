@@ -242,9 +242,16 @@ fn our_screen(game: &crate::game::Game<'_>, screen: &NativeScreenView<'_>) -> bo
 // --- hooks (called by the shims under hooks/) ---
 
 pub(super) fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
-    if !pressed || !game.native_on(ID) || !game.native_playing() {
+    if !pressed || !game.native_on(ID) {
         return;
     }
+    // The map toggle works whenever we are in a world (its own screen
+    // included); the gameplay keys need the world unobstructed.
+    let in_world = game.native_player().is_some();
+    if !in_world {
+        return;
+    }
+    let map_open = game.native_mod_screen() == Some(ID);
     let open_map = key == game.native_mod_key(ID, KEYS[0][0], KEYS[0][2]);
     let new_wp = key == game.native_mod_key(ID, KEYS[1][0], KEYS[1][2]);
     let list = key == game.native_mod_key(ID, KEYS[2][0], KEYS[2][2]);
@@ -254,6 +261,7 @@ pub(super) fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     if !(open_map || new_wp || list || toggle || zoom_in || zoom_out) {
         return;
     }
+    let playing = game.native_playing() || map_open;
     if open_map || list {
         // M toggles the map; the first open anchors the view on the player.
         let open = game.native_mod_screen() == Some(ID);
@@ -273,6 +281,9 @@ pub(super) fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
         });
         game.native_mod_screen_open(ID);
     } else if new_wp {
+        if !playing {
+            return;
+        }
         let p = game.native_player();
         with_mut(game, |s, _game| {
             if let Some(p) = p {
@@ -287,13 +298,16 @@ pub(super) fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
             }
         });
     } else if toggle {
+        if !playing {
+            return;
+        }
         with_mut(game, |s, _game| {
             let any_on = s.waypoints.iter().any(|w| w.enabled);
             for w in &mut s.waypoints {
                 w.enabled = !any_on;
             }
         });
-    } else if zoom_in || zoom_out {
+    } else if (zoom_in || zoom_out) && game.native_playing() {
         with_mut(game, |s, game| {
             s.minimap_zoom_step(zoom_in);
             s.save_minimap(game);
