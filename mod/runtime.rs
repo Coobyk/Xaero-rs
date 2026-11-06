@@ -1266,15 +1266,19 @@ pub(super) fn screen_render_post(
     }
     let [rx, ry, rw, rh] = screen.rect;
     game.native_fill(batch, screen.rect, 0xC810_1010);
+    if resized {
+        return; // composed next frame with the right window size
+    }
 
     with(game, |s| {
         let Some(map) = &s.map else { return };
         // Remember the window's GUI size for the next compose (in `frame`);
         // a changed size invalidates the composed image.
-        if (s.view_w - batch.width).abs() > 0.5 || (s.view_h - batch.height).abs() > 0.5 {
+        let resized = (s.view_w - batch.width).abs() > 0.5
+            || (s.view_h - batch.height).abs() > 0.5;
+        if resized {
             s.view_w = batch.width;
             s.view_h = batch.height;
-            s.map_dirty();
         }
         // Cover the window with the composed terrain image.
         let _ = game.native_sprite(
