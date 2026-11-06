@@ -130,7 +130,7 @@ pub(super) struct MapTile {
 impl MapTile {
     fn empty() -> Self {
         Self {
-            rgb: [[20, 20, 20]; 256],
+            rgb: [[34, 34, 40]; 256],
             height: [0; 256],
             depth: [0; 256],
             water: [false; 256],
@@ -305,7 +305,7 @@ impl TileStore {
                 tile.state[slot] = state_id;
                 tile.biome[slot] = chunk.biome(x, y, z);
                 tile.rgb[slot] = if color == 0 {
-                    [20, 20, 20]
+                    [34, 34, 40]
                 } else {
                     self.tinted(facts, biomes, chunk, x, y, z, color, wx0, wz0)
                 };
@@ -340,7 +340,7 @@ impl TileStore {
     ) -> [u8; 3] {
         let id = usize::from(color);
         if id == 0 || id >= horizon_client::blocks::MAP_COLORS.len() {
-            return [20, 20, 20];
+            return [34, 34, 40];
         }
         let col = horizon_client::blocks::MAP_COLORS[id];
         let state = chunk.block(x, y, z);
@@ -1158,7 +1158,7 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
                 let vcx = map.center_x.div_euclid(16.0) as i32;
                 let vcz = map.center_z.div_euclid(16.0) as i32;
                 let span = (s.view_w.max(s.view_h) as f64 * map.blocks_per_pixel / 16.0).ceil() as i32 + 1;
-                ((pcx + vcx) / 2, (pcz + vcz) / 2, (span / 2 + 1 + ((pcx.abs_diff(vcx) + pcz.abs_diff(vcz)) as i32) / 2).clamp(2, 24))
+                ((pcx + vcx) / 2, (pcz + vcz) / 2, (span / 2 + 1 + ((pcx.abs_diff(vcx) + pcz.abs_diff(vcz)) as i32) / 2).clamp(2, 64))
             }
             None => (pcx, pcz, 8),
         };
@@ -1217,9 +1217,9 @@ fn compose(s: &mut State, w: f32, h: f32) {
             }
             let i = (py * 1024 + px) * 4;
             let Some(t) = tile else {
-                img[i] = 20;
-                img[i + 1] = 20;
-                img[i + 2] = 20;
+                img[i] = 34;
+                img[i + 1] = 34;
+                img[i + 2] = 40;
                 img[i + 3] = 255;
                 continue;
             };
@@ -1308,7 +1308,7 @@ pub(super) fn screen_render_post(
         return;
     }
     let [rx, ry, rw, rh] = screen.rect;
-    game.native_fill(batch, screen.rect, 0xC810_1010);
+    game.native_fill(batch, screen.rect, 0xFF10_1014);
 
     // A changed window size invalidates the composed image; recompose next
     // frame and skip this one's (stale-projection) terrain.
