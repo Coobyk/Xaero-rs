@@ -156,8 +156,8 @@ pub(super) struct TileStore {
     /// lava, |4 air, |8 sturdy top) - the game minimap's Palette.
     color: Vec<u8>,
     flags: Vec<u8>,
-    /// Decoded Xaero regions, by region coords (512x512 blocks).
-    regions: std::collections::HashMap<(i32, i32), Option<Region>>,
+    /// Xaero regions already imported (or found absent) this session.
+    imported: std::collections::HashSet<(i32, i32)>,
     /// Regions whose tiles changed since the last save.
     dirty: std::collections::HashSet<(i32, i32)>,
 }
@@ -168,7 +168,7 @@ impl TileStore {
             tiles: Default::default(),
             color: Vec::new(),
             flags: Vec::new(),
-            regions: Default::default(),
+            imported: Default::default(),
             dirty: Default::default(),
         }
     }
@@ -196,13 +196,17 @@ impl TileStore {
         }
     }
 
-    /// Scans missing/stale tiles nearest-first under a time budget; true when
-    /// any tile's pixels changed. Mirrors the game minimap's update loop.
+    /// Brings the store up to date with the view: live-scans stale loaded
+    /// chunks inside the view rect (any zoom), and imports every intersecting
+    /// Xaero region once per session. Tiles are never evicted, so zooming
+    /// never re-renders. True when any tile's pixels changed.
     fn update(
         &mut self,
         game: &crate::game::Game<'_>,
-        center: (i32, i32),
-        radius: i32,
+        vcx: i32,
+        vcz: i32,
+        half_cx: i32,
+        half_cz: i32,
         budget: std::time::Duration,
     ) -> bool {
         if self.color.is_empty() {
@@ -211,45 +215,114 @@ impl TileStore {
         let started = std::time::Instant::now();
         let world = &game.world;
         let air = world.air.0;
-        self.tiles.retain(|k, _| {
-            (k.0 - center.0).abs() <= radius + 2
-                && (k.1 - center.1).abs() <= radius + 2
-                && world.chunks.contains_key(k)
-        });
         let mut changed = false;
-        for ring in 0..=radius {
-            for (dx, dz) in ring_offsets(ring) {
-                let key = (center.0 + dx, center.1 + dz);
-                let Some(chunk) = world.chunks.get(&key) else {
-                    continue;
-                };
-                let stale = match self.tiles.get(&key) {
-                    None => true,
-                    Some(t) => t.revision != world.revision && t.scanned.elapsed() >= RESCAN,
-                };
-                if !stale {
+        // 1. Loaded chunks in the view: rescan when the world changed under
+        //    them (or scan fresh ones).
+        for (key, chunk) in world.chunks.iter() {
+            if (key.0 - vcx).abs() > half_cx + 1 || (key.1 - vcz).abs() > half_cz + 1 {
+                continue;
+            }
+            let stale = match self.tiles.get(key) {
+                None => true,
+                Some(t) => t.revision != world.revision && t.scanned.elapsed() >= RESCAN,
+            };
+            if !stale {
+                continue;
+            }
+            let tile = self.scan_tile(game, chunk, air, world.revision);
+            self.dirty.insert((key.0.div_euclid(32), key.1.div_euclid(32)));
+            changed |= self
+                .tiles
+                .get(key)
+                .is_none_or(|t| t.rgb != tile.rgb);
+            self.tiles.insert(*key, tile);
+            if started.elapsed() >= budget {
+                return changed;
+            }
+        }
+        // 2. Xaero regions intersecting the view, imported whole, once.
+        let dim = super::umbx_xaero_storage::dimension_number(game.native_dimension());
+        let rx0 = (vcx - half_cx).div_euclid(32);
+        let rx1 = (vcx + half_cx).div_euclid(32);
+        let rz0 = (vcz - half_cz).div_euclid(32);
+        let rz1 = (vcz + half_cz).div_euclid(32);
+        for rx in rx0..=rx1 {
+            for rz in rz0..=rz1 {
+                if !self.imported.insert((rx, rz)) {
                     continue;
                 }
-                // Xaero region data covers terrain the live chunks don't have
-                // (explored before, out of render distance).
-                let tile = if chunk_ready(chunk, air) {
-                    self.scan_tile(game, chunk, air, world.revision)
-                } else if let Some(t) = self.import_tile(game, key) {
-                    t
-                } else {
-                    self.scan_tile(game, chunk, air, world.revision)
-                };
-                let (rx, rz) = (key.0.div_euclid(32), key.1.div_euclid(32));
-                self.dirty.insert((rx, rz));
-                let before = self.tiles.get(&key);
-                changed |= before.is_none_or(|t| t.rgb != tile.rgb);
-                self.tiles.insert(key, tile);
                 if started.elapsed() >= budget {
                     return changed;
                 }
+                changed |= self.import_region(game, dim, rx, rz);
             }
         }
         changed
+    }
+
+    /// Imports every tile of one region file into the store (missing keys
+    /// only: live scans are fresher).
+    fn import_region(
+        &mut self,
+        game: &crate::game::Game<'_>,
+        dim: i32,
+        rx: i32,
+        rz: i32,
+    ) -> bool {
+        let Some(region) = super::umbx_xaero_storage::load_region(game, dim, rx, rz) else {
+            return false;
+        };
+        let mut changed = false;
+        for chunk in &region.chunks {
+            let ccx = rx * 32 + i32::from(chunk.at.0) * 4;
+            let ccz = rz * 32 + i32::from(chunk.at.1) * 4;
+            for (ti, tile) in chunk.tiles.iter().enumerate() {
+                let Some(t) = tile else { continue };
+                let tx = (ti / 4) as i32;
+                let tz = (ti % 4) as i32;
+                let key = (ccx + tx, ccz + tz);
+                if self.tiles.contains_key(&key) {
+                    continue;
+                }
+                self.tiles.insert(key, self.convert_tile(game, t));
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Converts one region tile (x-major pixels) into a store tile
+    /// (z-major slots), resolving colours through the game's facts.
+    fn convert_tile(
+        &self,
+        game: &crate::game::Game<'_>,
+        t: &RegionTile,
+    ) -> MapTile {
+        let facts = game.res.facts();
+        let biomes = game.res.biomes();
+        let mut out = MapTile::empty();
+        for slot in 0..256usize {
+            // Region pixels are x-major; our slots z-major.
+            let px: &RegionPixel = &t.pixels[(slot % 16) * 16 + slot / 16];
+            out.height[slot] = px.height;
+            out.depth[slot] = px
+                .top_height
+                .map(|top| (i16::from(top) - px.height).max(0) as u8)
+                .unwrap_or(0);
+            out.water[slot] = px.state.as_deref() == Some("minecraft:water");
+            let name = px.state.as_deref().unwrap_or("minecraft:grass_block");
+            out.state[slot] = self
+                .color_by_name(name, facts)
+                .unwrap_or(0) as u16;
+            out.biome[slot] = px
+                .biome
+                .as_deref()
+                .and_then(|b| biomes.index.get(b).copied())
+                .unwrap_or(0);
+            out.rgb[slot] = self.import_rgb(game, px);
+        }
+        out.revision = 1;
+        out
     }
 
     /// One chunk column scan with biome tints (Xaero-style colours).
@@ -381,154 +454,9 @@ const GRASS_TINTS: [&str; 6] = [
     "minecraft:bush",
 ];
 
-/// Chunk ring offsets, nearest first (the game minimap's approach).
-fn ring_offsets(ring: i32) -> Vec<(i32, i32)> {
-    if ring == 0 {
-        return vec![(0, 0)];
-    }
-    let mut out = Vec::with_capacity(8 * ring as usize);
-    for i in -(ring - 1)..=ring {
-        out.push((i, -ring));
-        out.push((i, ring));
-    }
-    for i in -ring..=ring {
-        out.push((-ring, i));
-        out.push((ring, i));
-    }
-    out
-}
 
-/// Whether the chunk has the columns a live scan needs (world surface
-/// sections present, not just light data).
-fn chunk_ready(chunk: &std::sync::Arc<horizon_client::chunk::Chunk>, air: u32) -> bool {
-    (0..chunk.sections.len())
-        .rev()
-        .any(|s| (0..16).any(|x| chunk.get(x, chunk.min_y() + s as i32 * 16, 0) != air))
-        || chunk.world_surface(0, 0, |id| id == air) > chunk.min_y()
-}
 
 impl TileStore {
-    /// The decoded region for chunk `key`'s area, loading it once from disk.
-    fn region(
-        &mut self,
-        game: &crate::game::Game<'_>,
-        rx: i32,
-        rz: i32,
-    ) -> Option<&Region> {
-        let dim = super::umbx_xaero_storage::dimension_number(game.native_dimension());
-        self.regions.entry((rx, rz)).or_insert_with(|| {
-            super::umbx_xaero_storage::load_region(game, dim, rx, rz)
-        }).as_ref()
-    }
-
-    /// Builds a tile from the Xaero region data for chunk `key`, when the
-    /// region has that chunk.
-    fn import_tile(
-        &mut self,
-        game: &crate::game::Game<'_>,
-        key: (i32, i32),
-    ) -> Option<MapTile> {
-        let (cx, cz) = key;
-        let (rx, rz) = (cx.div_euclid(32), cz.div_euclid(32));
-        let rcx = cx.rem_euclid(32);
-        let rcz = cz.rem_euclid(32);
-        let region = self.region(game, rx, rz)?;
-        let chunk = region
-            .chunks
-            .iter()
-            .find(|c| c.at.0 == rcx as u8 && c.at.1 == rcz as u8)?
-            .clone();
-        let tx = (rcx % 4) as usize;
-        let tz = (rcz % 4) as usize;
-        // Region tiles are tx-outer, ours are tz-major indexed.
-        let tile = chunk.tiles.get(tx * 4 + tz)?.clone()?;
-        let facts = game.res.facts();
-        let biomes = game.res.biomes();
-        let mut out = MapTile::empty();
-        for slot in 0..256usize {
-            // Region pixels are x-major; our slots z-major.
-            let px: &RegionPixel = &tile.pixels[(slot % 16) * 16 + slot / 16];
-            out.height[slot] = px.height;
-            out.depth[slot] = px
-                .top_height
-                .map(|t| (t as i16 - px.height).max(0) as u8)
-                .unwrap_or(0);
-            out.water[slot] = px.state.as_deref() == Some("minecraft:water");
-            out.state[slot] = self
-                .color_by_name(px.state.as_deref().unwrap_or("minecraft:grass_block"), facts)
-                .unwrap_or(0) as u16;
-            out.biome[slot] = px
-                .biome
-                .as_deref()
-                .and_then(|b| biomes.index.get(b).copied())
-                .unwrap_or(0);
-            out.rgb[slot] = self.import_rgb(game, px);
-        }
-        out.revision = 1;
-        Some(out)
-    }
-
-    /// A block state id whose facts carry `name` (linear scan of the names;
-    /// used only on region import, then cached by the caller's tile).
-    fn color_by_name(
-        &self,
-        name: &str,
-        facts: &horizon_client::blocks::BlockFacts,
-    ) -> Option<u8> {
-        facts
-            .states
-            .iter()
-            .position(|f| &*f.name == name)
-            .map(|i| self.color[i])
-    }
-
-    /// The map RGB for an imported pixel: map colour of its state, tinted by
-    /// its biome.
-    fn import_rgb(
-        &self,
-        game: &crate::game::Game<'_>,
-        px: &RegionPixel,
-    ) -> [u8; 3] {
-        let facts = game.res.facts();
-        let biomes = game.res.biomes();
-        let name = px.state.as_deref().unwrap_or("minecraft:grass_block");
-        let id = self
-            .color_by_name(name, facts)
-            .map(|c| usize::from(c))
-            .filter(|c| *c != 0)
-            .unwrap_or(1.min(horizon_client::blocks::MAP_COLORS.len() - 1));
-        let col = horizon_client::blocks::MAP_COLORS[id];
-        let [r, g, b] = unpack(col);
-        let tint: u32 = if GRASS_TINTS.contains(&name) {
-            px.biome
-                .as_deref()
-                .and_then(|b| biomes.index.get(b).copied())
-                .map(|bi| {
-                    biomes.grass(bi, 0.0, 0.0)
-                })
-                .unwrap_or(0xFF_FF_FF)
-        } else if name.ends_with("_leaves") || name == "minecraft:vine" {
-            px.biome
-                .as_deref()
-                .and_then(|b| biomes.index.get(b).copied())
-                .map(|bi| biomes.get(bi).foliage)
-                .unwrap_or(0xFF_FF_FF)
-        } else if name == "minecraft:water" {
-            px.biome
-                .as_deref()
-                .and_then(|b| biomes.index.get(b).copied())
-                .map(|bi| biomes.get(bi).water)
-                .unwrap_or(0xFF_FF_FF)
-        } else {
-            0xFF_FF_FF
-        };
-        [
-            ((u32::from(r) * (tint >> 16 & 255)) >> 8) as u8,
-            ((u32::from(g) * (tint >> 8 & 255)) >> 8) as u8,
-            ((u32::from(b) * (tint & 255)) >> 8) as u8,
-        ]
-    }
-
     /// Exports one tile as a region tile (Xaero 7.8 stream data). The
     /// stream's pixels are x-major (`pixel = x*16 + z`); our tiles are
     /// z-major (`slot = z*16 + x`), like the game minimap's.
@@ -1096,7 +1024,7 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
             s.save_world_data(game);
             s.dimension = dim;
             s.store.tiles.clear();
-            s.store.regions.clear();
+            s.store.imported.clear();
             s.store.dirty.clear();
             s.wp_loaded = false;
             s.waypoints.clear();
@@ -1150,19 +1078,21 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
             s.save_timer = 0.0;
             s.save_world_data(game);
         }
-        let px = game.native_player().map(|p| (p.x, p.z));
-        let (pcx, pcz) = px.map(|p| (p.0.div_euclid(16.0) as i32, p.1.div_euclid(16.0) as i32)).unwrap_or((0, 0));
-        // Scan around the view when it is open, else around the player.
-        let (ccx, ccz, radius) = match &s.map {
+        // The view rect in chunks; the whole saved map renders at any zoom.
+        let (vcx, vcz, half_cx, half_cz) = match &s.map {
             Some(map) => {
                 let vcx = map.center_x.div_euclid(16.0) as i32;
                 let vcz = map.center_z.div_euclid(16.0) as i32;
-                let span = (s.view_w.max(s.view_h) as f64 * map.blocks_per_pixel / 16.0).ceil() as i32 + 1;
-                ((pcx + vcx) / 2, (pcz + vcz) / 2, (span / 2 + 1 + ((pcx.abs_diff(vcx) + pcz.abs_diff(vcz)) as i32) / 2).clamp(2, 64))
+                let half_cx = ((f64::from(s.view_w) * map.blocks_per_pixel / 2.0 / 16.0).ceil() as i32 + 1).clamp(1, 512);
+                let half_cz = ((f64::from(s.view_h) * map.blocks_per_pixel / 2.0 / 16.0).ceil() as i32 + 1).clamp(1, 512);
+                (vcx, vcz, half_cx, half_cz)
             }
-            None => (pcx, pcz, 8),
+            None => {
+                let p = game.native_player();
+                (p.map(|p| p.x.div_euclid(16.0) as i32).unwrap_or(0), p.map(|p| p.z.div_euclid(16.0) as i32).unwrap_or(0), 8, 8)
+            }
         };
-        if s.store.update(game, (ccx, ccz), radius, std::time::Duration::from_micros(2500)) {
+        if s.store.update(game, vcx, vcz, half_cx, half_cz, std::time::Duration::from_micros(2500)) {
             if let Some(map) = &mut s.map {
                 map.dirty = true;
             }
@@ -1353,29 +1283,19 @@ pub(super) fn screen_render_post(
         }
 
         // Radar dots on the map, in the same projection as the markers.
-        if s.minimap.radar
-            && let Some(pl) = game.native_player()
-        {
-            let half_x = span_x / 2.0;
-            let half_z = span_z / 2.0;
+        if s.minimap.radar {
             let dot = |batch: &mut horizon_client::hud::HudBatch, wx: f64, wz: f64, argb: u32, big: bool| {
-                let dx = (wx - pl.x) as f32 / map.blocks_per_pixel as f32;
-                let dz = (wz - pl.z) as f32 / map.blocks_per_pixel as f32;
-                let px2 = rx + rw / 2.0 + dx;
-                let py2 = ry + rh / 2.0 + dz;
+                let px2 = rx + ((wx - wx0) / span_x * rw as f64) as f32;
+                let py2 = ry + ((wz - wz0) / span_z * rh as f64) as f32;
                 if px2 < rx - 4.0 || py2 < ry - 4.0 || px2 > rx + rw + 4.0 || py2 > ry + rh + 4.0 {
                     return;
                 }
-                let _ = (half_x, half_z);
                 radar_dot(game, batch, [px2, py2], argb, big);
             };
             for m in game.mobs.iter().filter(|m| !m.removed && !m.invisible) {
-                let argb = if game.remote_player_uuid(m.id).is_some() {
-                    0xFF_FF_FF
-                } else {
-                    dot_color(&m.kind.id)
-                };
-                dot(batch, m.position.x, m.position.z, argb, game.remote_player_uuid(m.id).is_some());
+                let is_player = game.remote_player_uuid(m.id).is_some();
+                let argb = if is_player { 0xFF_FF_FF } else { dot_color(&m.kind.id) };
+                dot(batch, m.position.x, m.position.z, argb, is_player);
             }
             for item in game.dropped.iter() {
                 dot(batch, item.position.x, item.position.z, 0x53_F2_E8, false);
