@@ -216,7 +216,25 @@ impl TileStore {
         let world = &game.world;
         let air = world.air.0;
         let mut changed = false;
-        // 1. Loaded chunks in the view: rescan when the world changed under
+        // 1. Xaero regions intersecting the view, imported whole, once —
+        //    first, so saved terrain appears without waiting for live scans.
+        let dim = super::umbx_xaero_storage::dimension_number(game.native_dimension());
+        let rx0 = (vcx - half_cx).div_euclid(32);
+        let rx1 = (vcx + half_cx).div_euclid(32);
+        let rz0 = (vcz - half_cz).div_euclid(32);
+        let rz1 = (vcz + half_cz).div_euclid(32);
+        for rx in rx0..=rx1 {
+            for rz in rz0..=rz1 {
+                if !self.imported.insert((rx, rz)) {
+                    continue;
+                }
+                changed |= self.import_region(game, dim, rx, rz);
+                // One region load per frame: a zip decode is a hitch, and
+                // the rest continue over the next frames.
+                return changed;
+            }
+        }
+        // 2. Loaded chunks in the view: rescan when the world changed under
         //    them (or scan fresh ones).
         for (key, chunk) in world.chunks.iter() {
             if (key.0 - vcx).abs() > half_cx + 1 || (key.1 - vcz).abs() > half_cz + 1 {
@@ -238,23 +256,6 @@ impl TileStore {
             self.tiles.insert(*key, tile);
             if started.elapsed() >= budget {
                 return changed;
-            }
-        }
-        // 2. Xaero regions intersecting the view, imported whole, once.
-        let dim = super::umbx_xaero_storage::dimension_number(game.native_dimension());
-        let rx0 = (vcx - half_cx).div_euclid(32);
-        let rx1 = (vcx + half_cx).div_euclid(32);
-        let rz0 = (vcz - half_cz).div_euclid(32);
-        let rz1 = (vcz + half_cz).div_euclid(32);
-        for rx in rx0..=rx1 {
-            for rz in rz0..=rz1 {
-                if !self.imported.insert((rx, rz)) {
-                    continue;
-                }
-                if started.elapsed() >= budget {
-                    return changed;
-                }
-                changed |= self.import_region(game, dim, rx, rz);
             }
         }
         changed
@@ -397,8 +398,42 @@ impl TileStore {
         )
     }
 
-    /// The map colour for a column, multiplied by the biome tint for the
-    /// tintable surfaces (grass, foliage, water), as Xaero's map does.
+    /// The final colour of a column: Xaero's map paints the biome colour
+    /// itself for grass, foliage and water (not the muted vanilla map colour
+    /// multiplied by a tint), and mildly saturates the rest.
+    fn surface_rgb(
+        &self,
+        biomes: &std::sync::Arc<horizon_client::biome::Biomes>,
+        name: &str,
+        color: u8,
+        biome: u16,
+        wx: f64,
+        wz: f64,
+    ) -> [u8; 3] {
+        if GRASS_TINTS.contains(&name) {
+            return unpack(biomes.grass(biome, wx, wz));
+        }
+        if name.ends_with("_leaves") || name == "minecraft:vine" {
+            return unpack(biomes.get(biome).foliage);
+        }
+        if name == "minecraft:water" {
+            return unpack(biomes.get(biome).water);
+        }
+        let id = usize::from(color);
+        if id == 0 || id >= horizon_client::blocks::MAP_COLORS.len() {
+            return [34, 34, 40];
+        }
+        // Mild saturation boost (+35% away from grey), Xaero's map colours
+        // are punchier than the vanilla map item's.
+        let [r, g, b] = unpack(horizon_client::blocks::MAP_COLORS[id]);
+        let gray = (u32::from(r) + u32::from(g) + u32::from(b)) / 3;
+        let sat = |c: u8| {
+            (gray + (u32::from(c) - gray) * 135 / 100).min(255) as u8
+        };
+        [sat(r), sat(g), sat(b)]
+    }
+
+    /// The final colour of a scanned column.
     fn tinted(
         &self,
         facts: &horizon_client::blocks::BlockFacts,
@@ -411,32 +446,19 @@ impl TileStore {
         wx0: i32,
         wz0: i32,
     ) -> [u8; 3] {
-        let id = usize::from(color);
-        if id == 0 || id >= horizon_client::blocks::MAP_COLORS.len() {
-            return [34, 34, 40];
-        }
-        let col = horizon_client::blocks::MAP_COLORS[id];
         let state = chunk.block(x, y, z);
-        let Some(f) = facts.states.get(state.0 as usize) else {
-            return unpack(col);
+        let (name, biome) = match facts.states.get(state.0 as usize) {
+            Some(f) => (&*f.name, chunk.biome(x, y, z)),
+            None => ("minecraft:grass_block", 0),
         };
-        let name: &str = &f.name;
-        let tint: u32 = if GRASS_TINTS.contains(&name) {
-            let b = chunk.biome(x, y, z);
-            biomes.grass(b, f64::from(wx0 + x), f64::from(wz0 + z))
-        } else if name.ends_with("_leaves") || name == "minecraft:vine" {
-            biomes.get(chunk.biome(x, y, z)).foliage
-        } else if name == "minecraft:water" {
-            biomes.get(chunk.biome(x, y, z)).water
-        } else {
-            0xFF_FF_FF
-        };
-        let [r, g, b] = unpack(col);
-        [
-            ((u32::from(r) * (tint >> 16 & 255)) >> 8) as u8,
-            ((u32::from(g) * (tint >> 8 & 255)) >> 8) as u8,
-            ((u32::from(b) * (tint & 255)) >> 8) as u8,
-        ]
+        self.surface_rgb(
+            biomes,
+            name,
+            color,
+            biome,
+            f64::from(wx0 + x),
+            f64::from(wz0 + z),
+        )
     }
 }
 
@@ -470,8 +492,8 @@ impl TileStore {
             .map(|i| self.color[i])
     }
 
-    /// The map RGB for an imported pixel: map colour of its state, tinted by
-    /// its biome.
+    /// The map RGB for an imported pixel, through the same colours as a
+    /// fresh scan.
     fn import_rgb(
         &self,
         game: &crate::game::Game<'_>,
@@ -480,39 +502,13 @@ impl TileStore {
         let facts = game.res.facts();
         let biomes = game.res.biomes();
         let name = px.state.as_deref().unwrap_or("minecraft:grass_block");
-        let id = self
-            .color_by_name(name, facts)
-            .map(usize::from)
-            .filter(|c| *c != 0)
-            .unwrap_or(1);
-        let col = horizon_client::blocks::MAP_COLORS[id.min(horizon_client::blocks::MAP_COLORS.len() - 1)];
-        let [r, g, b] = unpack(col);
-        let tint: u32 = if GRASS_TINTS.contains(&name) {
-            px.biome
-                .as_deref()
-                .and_then(|b| biomes.index.get(b).copied())
-                .map(|bi| biomes.grass(bi, 0.0, 0.0))
-                .unwrap_or(0xFF_FF_FF)
-        } else if name.ends_with("_leaves") || name == "minecraft:vine" {
-            px.biome
-                .as_deref()
-                .and_then(|b| biomes.index.get(b).copied())
-                .map(|bi| biomes.get(bi).foliage)
-                .unwrap_or(0xFF_FF_FF)
-        } else if name == "minecraft:water" {
-            px.biome
-                .as_deref()
-                .and_then(|b| biomes.index.get(b).copied())
-                .map(|bi| biomes.get(bi).water)
-                .unwrap_or(0xFF_FF_FF)
-        } else {
-            0xFF_FF_FF
-        };
-        [
-            ((u32::from(r) * (tint >> 16 & 255)) >> 8) as u8,
-            ((u32::from(g) * (tint >> 8 & 255)) >> 8) as u8,
-            ((u32::from(b) * (tint & 255)) >> 8) as u8,
-        ]
+        let color = self.color_by_name(name, facts).unwrap_or(1);
+        let biome = px
+            .biome
+            .as_deref()
+            .and_then(|b| biomes.index.get(b).copied())
+            .unwrap_or(0);
+        self.surface_rgb(biomes, name, color, biome, 0.0, 0.0)
     }
 
     /// Exports one tile as a region tile (Xaero 7.8 stream data). The
@@ -632,6 +628,8 @@ pub struct State {
     pub save_timer: f32,
     /// The death screen was up last frame (edge detection for deathpoints).
     pub was_dead: bool,
+    /// Frame parity flip for the half-rate compose while panning.
+    pub frame_parity: bool,
     /// The last position while alive: where a deathpoint goes.
     pub last_alive: Option<[f64; 3]>,
 }
@@ -654,6 +652,7 @@ impl State {
             save_timer: 0.0,
             was_dead: false,
             last_alive: None,
+            frame_parity: false,
         };
         let get = |key: &str| game.native_setting(ID, key);
         if get("minimap_enabled").is_some() {
@@ -730,6 +729,24 @@ impl State {
         } else if !inward && *z + 1 < MINIMAP_ZOOMS.len() {
             *z += 1;
         }
+    }
+}
+
+/// The biome's display name for the status line (`minecraft:plains` ->
+/// "Plains").
+fn game_biome_name(game: &crate::game::Game<'_>, b: u16) -> String {
+    let name = game
+        .res
+        .biomes()
+        .list
+        .get(usize::from(b))
+        .map(|i| i.name.clone())
+        .unwrap_or_default();
+    let short = name.rsplit(':').next().unwrap_or(&name).replace('_', " ");
+    let mut c = short.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => short,
     }
 }
 
@@ -1161,9 +1178,14 @@ pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Durat
             }
         }
         // Compose and upload while our screen is open; `native_mod_image`
-        // needs `&mut self`, so this is the one place it can happen.
+        // needs `&mut self`, so this is the one place it can happen. While a
+        // drag pans the map, compose at half rate: a 1024x1024 compose plus
+        // its 4 MiB upload every frame is the FPS drop the map used to have.
+        s.frame_parity ^= 1;
+        let dragging = s.map.as_ref().is_some_and(|m| m.dragging.is_some());
         let dirty = s.map.as_ref().is_some_and(|m| m.dirty);
-        if game.native_mod_screen() == Some(ID) && dirty {
+        let due = !dragging || s.frame_parity;
+        if game.native_mod_screen() == Some(ID) && dirty && due {
             compose(s, s.view_w.max(320.0), s.view_h.max(200.0));
             compose_upload = true;
         }
@@ -1365,11 +1387,28 @@ pub(super) fn screen_render_post(
             }
         }
 
-        // Status line: coordinates and scale.
-        let status = format!(
-            "{:.0}, {:.0}   {:.2} blocks/px   wheel zoom, drag pan, M to close",
-            map.center_x, map.center_z, map.blocks_per_pixel
-        );
+        // Status line: the pointer's world position and biome when it is on
+        // the map, else the view centre; scale on the right.
+        let (mut at_x, mut at_z) = (map.center_x, map.center_z);
+        let [moux, mouy] = screen.mouse;
+        let on_map = moux >= rx && moux < rx + rw && mouy >= ry && mouy < ry + rh;
+        if on_map {
+            at_x = wx0 + (f64::from(moux - rx) / f64::from(rw)) * span_x;
+            at_z = wz0 + (f64::from(mouy - ry) / f64::from(rh)) * span_z;
+        }
+        let mut status = format!("{:.0}, {:.0}", at_x, at_z);
+        if on_map {
+            let b = s
+                .store
+                .tiles
+                .get(&(at_x.div_euclid(16.0) as i32, at_z.div_euclid(16.0) as i32))
+                .map(|t| t.biome[(at_z.rem_euclid(16.0) as usize) * 16 + (at_x.rem_euclid(16.0) as usize)]);
+            if let Some(b) = b {
+                let name = game_biome_name(game, b);
+                status.push_str(&format!("  {name}"));
+            }
+        }
+        status.push_str(&format!("   {:.2} blocks/px", map.blocks_per_pixel));
         game.native_text(
             batch,
             &status,

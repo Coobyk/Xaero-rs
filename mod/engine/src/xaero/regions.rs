@@ -637,6 +637,26 @@ pub fn zip_region(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decode_host_region() {
+        use crate::xaero::regions;
+        let paths = [
+            "/home/coobyk/.local/share/horizon/XaeroWorldMap/Chunkyied/null/0_0.zip",
+            "/home/coobyk/.local/share/horizon/XaeroWorldMap/xaero-test2/null/0_0.zip",
+        ];
+        let mut checked = 0;
+        for p in paths {
+            let Ok(zip) = std::fs::read(p) else { continue };
+            checked += 1;
+            let stream = regions::unzip_region(&zip).expect("unzip");
+            let region = regions::decode_region(&stream).expect("decode");
+            let tiles: usize = region.chunks.iter().map(|c| c.tiles.iter().flatten().count()).sum();
+            println!("{p}: chunks={} tiles={} truncated={}", region.chunks.len(), tiles, region.truncated);
+            assert!(tiles > 0, "region has no tiles");
+        }
+        assert!(checked > 0, "no region files found to test");
+    }
+
 
     fn grass_px(height: i16, biome: &str) -> Pixel {
         Pixel {
