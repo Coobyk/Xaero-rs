@@ -241,7 +241,7 @@ fn our_screen(game: &crate::game::Game<'_>, screen: &NativeScreenView<'_>) -> bo
 
 // --- hooks (called by the shims under hooks/) ---
 
-pub fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
+pub(super) fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     if !pressed || !game.native_on(ID) || !game.native_playing() {
         return;
     }
@@ -301,7 +301,7 @@ pub fn key(game: &mut crate::game::Game<'_>, key: &str, pressed: bool) {
     }
 }
 
-pub fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Duration) {
+pub(super) fn frame(game: &mut crate::game::Game<'_>, _elapsed: std::time::Duration) {
     if game.native_mod_screen() != Some(ID) || !game.native_on(ID) {
         return;
     }
@@ -356,11 +356,11 @@ fn compose_test(map: &MapView, span: f64) -> Vec<u8> {
     img
 }
 
-pub fn minimap(game: &crate::game::Game<'_>, minimap: &mut Option<NativeMinimap>) {
+pub(super) fn minimap(game: &crate::game::Game<'_>, minimap: &mut Option<NativeMinimap>) {
     with(game, |s| *minimap = s.minimap.native());
 }
 
-pub fn world_primitives(
+pub(super) fn world_primitives(
     game: &crate::game::Game<'_>,
     _partial: f32,
     _camera: [f64; 3],
@@ -382,7 +382,7 @@ pub fn world_primitives(
     });
 }
 
-pub fn screen_render_post(
+pub(super) fn screen_render_post(
     game: &crate::game::Game<'_>,
     batch: &mut horizon_client::hud::HudBatch,
     screen: &NativeScreenView<'_>,
@@ -433,7 +433,7 @@ pub fn screen_render_post(
     });
 }
 
-pub fn screen_pressed(
+pub(super) fn screen_pressed(
     game: &crate::game::Game<'_>,
     screen: &NativeScreenView<'_>,
     button: i32,
@@ -450,7 +450,7 @@ pub fn screen_pressed(
     });
 }
 
-pub fn screen_released(
+pub(super) fn screen_released(
     game: &crate::game::Game<'_>,
     screen: &NativeScreenView<'_>,
     button: i32,
@@ -468,7 +468,7 @@ pub fn screen_released(
     });
 }
 
-pub fn screen_dragged(
+pub(super) fn screen_dragged(
     game: &crate::game::Game<'_>,
     screen: &NativeScreenView<'_>,
     button: i32,
@@ -492,7 +492,7 @@ pub fn screen_dragged(
     });
 }
 
-pub fn screen_scrolled(
+pub(super) fn screen_scrolled(
     game: &crate::game::Game<'_>,
     screen: &NativeScreenView<'_>,
     scroll: [f64; 2],
@@ -512,7 +512,7 @@ pub fn screen_scrolled(
     });
 }
 
-pub fn screen_key(
+pub(super) fn screen_key(
     game: &crate::game::Game<'_>,
     screen: &NativeScreenView<'_>,
     key: &str,
@@ -544,7 +544,7 @@ pub fn screen_key(
     *canceled = true;
 }
 
-pub fn screen_char(
+pub(super) fn screen_char(
     game: &crate::game::Game<'_>,
     screen: &NativeScreenView<'_>,
     c: char,
@@ -558,14 +558,14 @@ pub fn screen_char(
     *canceled = true;
 }
 
-pub fn settings(game: &mut crate::game::Game<'_>, mod_id: &str, buttons: &mut Vec<String>) {
+pub(super) fn settings(game: &mut crate::game::Game<'_>, mod_id: &str, buttons: &mut Vec<String>) {
     if mod_id != ID {
         return;
     }
     with_mut(game, |s, _game| buttons.extend(s.minimap_labels()));
 }
 
-pub fn settings_click(game: &mut crate::game::Game<'_>, mod_id: &str, button: usize) {
+pub(super) fn settings_click(game: &mut crate::game::Game<'_>, mod_id: &str, button: usize) {
     if mod_id != ID {
         return;
     }
@@ -576,13 +576,13 @@ pub fn settings_click(game: &mut crate::game::Game<'_>, mod_id: &str, button: us
     });
 }
 
-pub fn player_died(game: &mut crate::game::Game<'_>, _player: u128, _cause: Option<&str>) {
+pub(super) fn player_died(game: &mut crate::game::Game<'_>, _player: u128, _cause: Option<&str>) {
     // Deathpoint waypoints land here (compare `player` with the local
     // player's UUID first once we track it).
     let _ = game;
 }
 
-pub fn list(mods: &mut Vec<NativeMod>) {
+pub(super) fn list(mods: &mut Vec<NativeMod>) {
     mods.push(NativeMod {
         id: ID.to_owned(),
         title: format!("{TITLE} {}", xaero_rs_engine::VERSION),
