@@ -27,21 +27,21 @@ pub enum WaypointColor {
 
 pub const WAYPOINT_COLORS: [u32; 16] = [
     0xFF00_38DB, // blue
-    0xFF00DBDB, // cyan
-    0xFF00DB00, // green
-    0xFFDBDB00, // yellow
-    0xFFDB7500, // orange
-    0xFFDB0000, // red
-    0xFFFF00FF, // pink
-    0xFFDB00DB, // magenta
-    0xFF9B00DB, // purple
-    0xFF7B7B7B, // gray
-    0xFFFFFFFF, // white
-    0xFF8B5A2B, // brown
-    0xFF8B0000, // dark red
-    0xFF006400, // dark green
-    0xFF00008B, // dark blue
-    0xFF141414, // black
+    0xFF00DBDB,  // cyan
+    0xFF00DB00,  // green
+    0xFFDBDB00,  // yellow
+    0xFFDB7500,  // orange
+    0xFFDB0000,  // red
+    0xFFFF00FF,  // pink
+    0xFFDB00DB,  // magenta
+    0xFF9B00DB,  // purple
+    0xFF7B7B7B,  // gray
+    0xFFFFFFFF,  // white
+    0xFF8B5A2B,  // brown
+    0xFF8B0000,  // dark red
+    0xFF006400,  // dark green
+    0xFF00008B,  // dark blue
+    0xFF141414,  // black
 ];
 
 impl WaypointColor {
