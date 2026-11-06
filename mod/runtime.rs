@@ -836,7 +836,7 @@ fn minimap_rect(
 pub(super) fn hud(
     game: &mut crate::game::Game<'_>,
     batch: &mut horizon_client::hud::HudBatch,
-    _corners: &mut horizon_client::extras_hud::Corners,
+    corners: &mut horizon_client::extras_hud::Corners,
 ) {
     if !game.native_on(ID) {
         return;
