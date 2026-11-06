@@ -1,0 +1,7 @@
+[package]
+name = "xaero-rs-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Game-independent core of Xaero-rs: waypoint model, Xaero file formats, map tile store, colors"
+
+[dependencies]
